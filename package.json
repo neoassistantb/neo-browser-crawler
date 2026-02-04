@@ -1,0 +1,12 @@
+{
+  "name": "neo-browser-crawler",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "playwright": "^1.41.0"
+  }
+}
