@@ -4,7 +4,7 @@ import { chromium } from "playwright";
 const PORT = Number(process.env.PORT || 10000);
 
 // Worker config - за изпращане на SiteMap
-const WORKER_URL = process.env.NEO_WORKER_URL || "https://neo-worker.onrender.com";
+const WORKER_URL = process.env.NEO_WORKER_URL || "https://neo-workerv2-oky6.onrender.com";
 const WORKER_SECRET = process.env.NEO_WORKER_SECRET || "";
 
 // Supabase config - за записване на SiteMap
