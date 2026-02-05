@@ -1002,7 +1002,6 @@ async function crawlSmart(startUrl, siteId = null) {
 // ================= HTTP SERVER =================
 http
   .createServer((req, res) => {
-    console.log("[INCOMING]", req.method, req.url);
     if (req.method === "GET") {
       res.writeHead(200, { "Content-Type": "application/json" });
       return res.end(JSON.stringify({ 
