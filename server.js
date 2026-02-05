@@ -11,7 +11,7 @@ const CRAWLER_TOKEN = process.env.CRAWLER_TOKEN || "";
 // OCR
 const GOOGLE_VISION_API_KEY = process.env.GOOGLE_VISION_API_KEY || "";
 
-// Worker (KEEP)
+// Worker (optional)
 const WORKER_URL = process.env.NEO_WORKER_URL || "";
 const WORKER_SECRET = process.env.NEO_WORKER_SECRET || "";
 
@@ -24,7 +24,7 @@ const OCR_TIMEOUT_MS = 6000;
 
 // In-memory job store
 const JOB_TTL_MS = 15 * 60 * 1000;
-const jobs = new Map();
+const jobs = new Map(); // job_id -> job
 const visited = new Set();
 const globalOcrCache = new Map();
 
@@ -38,25 +38,27 @@ function corsHeaders() {
   return {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-    "Access-Control-Allow-Headers":
-      "content-type, authorization, x-request-id, x-crawler-token",
+    "Access-Control-Allow-Headers": "content-type, authorization, x-request-id, x-crawler-token",
   };
 }
 
 // ================= UTILS =================
 const clean = (t = "") =>
-  t.replace(/\r/g, "").replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
+  String(t)
+    .replace(/\r/g, "")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 
-const countWordsExact = (t = "") =>
-  (t.match(/[A-Za-zА-Яа-я0-9]+/g) || []).length;
+const countWordsExact = (t = "") => (String(t).match(/[A-Za-zА-Яа-я0-9]+/g) || []).length;
 
-function getReqId(req: any) {
+function getReqId(req) {
   const v = req.headers["x-request-id"];
   if (typeof v === "string" && v.trim()) return v.trim();
   return crypto.randomUUID();
 }
 
-function getPath(req: any) {
+function getPath(req) {
   try {
     const u = new URL(req.url, "http://localhost");
     return u.pathname;
@@ -65,7 +67,7 @@ function getPath(req: any) {
   }
 }
 
-function getQuery(req: any) {
+function getQuery(req) {
   try {
     const u = new URL(req.url, "http://localhost");
     return u.searchParams;
@@ -74,15 +76,15 @@ function getQuery(req: any) {
   }
 }
 
-async function readBody(req: any) {
-  return await new Promise<string>((resolve) => {
+async function readBody(req) {
+  return await new Promise((resolve) => {
     let data = "";
-    req.on("data", (c: any) => (data += c));
+    req.on("data", (c) => (data += c));
     req.on("end", () => resolve(data));
   });
 }
 
-function json(res: any, status: number, obj: any) {
+function json(res, status, obj) {
   const body = JSON.stringify(obj);
   res.writeHead(status, {
     ...corsHeaders(),
@@ -91,11 +93,10 @@ function json(res: any, status: number, obj: any) {
   res.end(body);
 }
 
-function normalizeUrl(u: string) {
+function normalizeUrl(u) {
   try {
     const url = new URL(u);
     url.hash = "";
-    // normalize trailing slash (keep root "/")
     if (url.pathname !== "/" && url.pathname.endsWith("/")) url.pathname = url.pathname.slice(0, -1);
     return url.toString();
   } catch {
@@ -104,8 +105,7 @@ function normalizeUrl(u: string) {
 }
 
 // ================= AUTH =================
-function checkAuth(req: any, reqId: string) {
-  // Allow if no secrets configured
+function checkAuth(req, reqId) {
   if (!CRAWLER_SECRET && !CRAWLER_TOKEN) return true;
 
   const auth = req.headers["authorization"];
@@ -122,50 +122,44 @@ function checkAuth(req: any, reqId: string) {
     (CRAWLER_SECRET && bearer === CRAWLER_SECRET) ||
     (CRAWLER_TOKEN && (bearer === CRAWLER_TOKEN || token === CRAWLER_TOKEN));
 
-  if (!ok) {
-    console.log(`[AUTH] ${reqId} Unauthorized (missing/invalid token)`);
-  }
-
+  if (!ok) console.log(`[AUTH] ${reqId} Unauthorized (missing/invalid token)`);
   return ok;
 }
 
 // ================= SIMPLE SITEMAP FETCH =================
-async function fetchWithTimeout(url: string, ms: number) {
+async function fetchWithTimeout(url, ms) {
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), ms);
   try {
-    const r = await fetch(url, { signal: controller.signal });
-    return r;
+    return await fetch(url, { signal: controller.signal });
   } finally {
     clearTimeout(t);
   }
 }
 
-// Extract <loc>...</loc> values from XML
-function extractLocs(xml: string) {
-  const out: string[] = [];
+function extractLocs(xml) {
+  const out = [];
   const re = /<loc>\s*([^<]+)\s*<\/loc>/gi;
-  let m: RegExpExecArray | null;
+  let m;
   while ((m = re.exec(xml))) {
-    const v = m[1]?.trim();
+    const v = (m[1] || "").trim();
     if (v) out.push(v);
   }
   return out;
 }
 
-// Try sitemap.xml and sitemap_index.xml; also handle index -> nested sitemaps
-async function seedUrlsFromSitemap(baseOrigin: string) {
+async function seedUrlsFromSitemap(baseOrigin) {
   const candidates = [
     `${baseOrigin}/sitemap.xml`,
     `${baseOrigin}/sitemap_index.xml`,
     `${baseOrigin}/sitemap-index.xml`,
   ];
 
-  const seenSitemaps = new Set<string>();
-  const foundUrls: string[] = [];
+  const seenSitemaps = new Set();
+  const foundUrls = [];
 
-  async function readSitemap(sitemapUrl: string, depth: number) {
-    if (depth > 2) return; // keep it safe
+  async function readSitemap(sitemapUrl, depth) {
+    if (depth > 2) return;
     if (seenSitemaps.has(sitemapUrl)) return;
     seenSitemaps.add(sitemapUrl);
 
@@ -175,7 +169,6 @@ async function seedUrlsFromSitemap(baseOrigin: string) {
       const xml = await r.text();
       const locs = extractLocs(xml);
 
-      // If it looks like an index (contains other .xml), read those
       const xmlLinks = locs.filter((l) => /\.xml(\?|$)/i.test(l));
       if (xmlLinks.length > 0) {
         for (const child of xmlLinks.slice(0, 50)) {
@@ -184,7 +177,6 @@ async function seedUrlsFromSitemap(baseOrigin: string) {
         return;
       }
 
-      // Otherwise it's a urlset
       for (const u of locs) foundUrls.push(u);
     } catch {
       // ignore
@@ -196,8 +188,7 @@ async function seedUrlsFromSitemap(baseOrigin: string) {
     if (foundUrls.length > 0) break;
   }
 
-  // Normalize, same-origin only
-  const normalized = new Set<string>();
+  const normalized = new Set();
   for (const u of foundUrls) {
     try {
       const x = new URL(u);
@@ -211,11 +202,10 @@ async function seedUrlsFromSitemap(baseOrigin: string) {
 }
 
 // ================= OCR =================
-async function ocrImageUrl(imageUrl: string) {
+async function ocrImageUrl(imageUrl) {
   if (!GOOGLE_VISION_API_KEY) return "";
 
   try {
-    // cache
     if (globalOcrCache.has(imageUrl)) return globalOcrCache.get(imageUrl);
 
     const body = {
@@ -227,11 +217,14 @@ async function ocrImageUrl(imageUrl: string) {
       ],
     };
 
-    const r = await fetch(`https://vision.googleapis.com/v1/images:annotate?key=${GOOGLE_VISION_API_KEY}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
+    const r = await fetch(
+      `https://vision.googleapis.com/v1/images:annotate?key=${GOOGLE_VISION_API_KEY}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+    );
 
     const data = await r.json().catch(() => null);
     const text =
@@ -246,11 +239,9 @@ async function ocrImageUrl(imageUrl: string) {
   }
 }
 
-async function ocrAllImages(page: any, stats: any) {
-  const start = Date.now();
-
+async function ocrAllImages(page, stats) {
   try {
-    const imgElements = await page.$$eval("img", (imgs: any[]) =>
+    const imgElements = await page.$$eval("img", (imgs) =>
       imgs
         .map((img) => ({
           src: img.currentSrc || img.src || img.getAttribute("src") || "",
@@ -258,7 +249,7 @@ async function ocrAllImages(page: any, stats: any) {
           h: img.naturalHeight || img.height || 0,
           alt: img.alt || "",
         }))
-        .filter((x) => x.src)
+        .filter((x) => x.src),
     );
 
     const validImages = imgElements.filter((img) => {
@@ -270,7 +261,7 @@ async function ocrAllImages(page: any, stats: any) {
 
     console.log(`[OCR] ${validImages.length}/${imgElements.length} images to process`);
 
-    const results: any[] = [];
+    const results = [];
     let idx = 0;
 
     while (idx < validImages.length) {
@@ -278,26 +269,20 @@ async function ocrAllImages(page: any, stats: any) {
       idx += PARALLEL_OCR;
 
       const batchPromises = batch.map(async (img) => {
-        const t0 = Date.now();
         try {
           const p = Promise.race([
             ocrImageUrl(img.src),
-            new Promise<string>((resolve) => setTimeout(() => resolve(""), OCR_TIMEOUT_MS)),
+            new Promise((resolve) => setTimeout(() => resolve(""), OCR_TIMEOUT_MS)),
           ]);
 
           const text = await p;
-          if (text && text.trim().length > 0) {
+          if (text && String(text).trim().length > 0) {
             stats.ocrElementsProcessed++;
             stats.ocrCharsExtracted += text.length;
             return { text, src: img.src, alt: img.alt };
           }
         } catch {
           // ignore
-        } finally {
-          const dt = Date.now() - t0;
-          if (dt > OCR_TIMEOUT_MS) {
-            // just informational
-          }
         }
         return null;
       });
@@ -306,26 +291,21 @@ async function ocrAllImages(page: any, stats: any) {
       results.push(...batchResults.filter((r) => r !== null));
     }
 
-    const dt = Date.now() - start;
-    if (dt > 5000) {
-      // slow OCR batch - ok
-    }
-
     return results;
-  } catch (e: any) {
+  } catch (e) {
     console.error("[OCR ERROR]", e?.message || e);
     return [];
   }
 }
 
 // ================= LINK DISCOVERY =================
-async function collectAllLinks(page: any, base: string) {
+async function collectAllLinks(page, base) {
   try {
-    return await page.evaluate((baseOrigin: string) => {
-      const urls = new Set<string>();
+    return await page.evaluate((baseOrigin) => {
+      const urls = new Set();
       document.querySelectorAll("a[href]").forEach((a) => {
         try {
-          const u = new URL((a as HTMLAnchorElement).href, baseOrigin);
+          const u = new URL(a.href, baseOrigin);
           if (u.origin === baseOrigin) urls.add(u.href.split("#")[0]);
         } catch {}
       });
@@ -336,16 +316,92 @@ async function collectAllLinks(page: any, base: string) {
   }
 }
 
-// ================= STRUCTURED EXTRACTION (existing) =================
-// NOTE: оставяме логиката както е, за да не чупим поведението.
-// Във файла ти има големи помощни функции: detectPageType, extractStructured,
-// extractSiteMapFromPage, enrichSiteMap, buildCombinedSiteMap, sendSiteMapToWorker,
-// numberToBgWords, normalizeNumbers, etc.
-// ---- START: keep existing helpers ----
+// ================= MINIMAL HELPERS (no TS / no placeholders) =================
+function normalizeNumbers(text) {
+  // ако имаш твоя по-умен normalizeNumbers – сложи го тук.
+  return text;
+}
 
-// (Пази твоите helper-и, не ги променям извън нужните места)
+async function extractStructured(page) {
+  // Взимаме максимално безопасно: title + bodyText
+  const rawContent = await page.evaluate(() => {
+    const t = document.title || "";
+    const bodyText = document.body ? document.body.innerText || "" : "";
+    return `${t}\n\n${bodyText}`;
+  });
+  return { rawContent };
+}
 
-function detectPageType(url: string, title: string) {
+async function extractSiteMapFromPage(page) {
+  // Минимално: сканира бутони/форми като selectors + текст
+  try {
+    return await page.evaluate(() => {
+      const buttons = Array.from(document.querySelectorAll("button, a[role='button'], input[type='button'], input[type='submit']"))
+        .slice(0, 200)
+        .map((el) => ({
+          tag: el.tagName.toLowerCase(),
+          text: (el.innerText || el.value || "").trim().slice(0, 120),
+        }))
+        .filter((b) => b.text);
+
+      const forms = Array.from(document.querySelectorAll("form"))
+        .slice(0, 50)
+        .map((f) => ({
+          action: (f.getAttribute("action") || "").slice(0, 200),
+          method: (f.getAttribute("method") || "get").toLowerCase(),
+          inputs: Array.from(f.querySelectorAll("input, textarea, select"))
+            .slice(0, 100)
+            .map((i) => ({
+              name: i.getAttribute("name") || "",
+              type: i.getAttribute("type") || i.tagName.toLowerCase(),
+              placeholder: (i.getAttribute("placeholder") || "").slice(0, 80),
+            })),
+        }));
+
+      return { buttons, forms };
+    });
+  } catch {
+    return { buttons: [], forms: [] };
+  }
+}
+
+function enrichSiteMap(raw, siteId, base) {
+  return {
+    siteId,
+    base,
+    buttons: raw?.buttons || [],
+    forms: raw?.forms || [],
+  };
+}
+
+function buildCombinedSiteMap(maps, siteId, base) {
+  const buttons = [];
+  const forms = [];
+  for (const m of maps || []) {
+    if (Array.isArray(m.buttons)) buttons.push(...m.buttons);
+    if (Array.isArray(m.forms)) forms.push(...m.forms);
+  }
+  return { siteId, base, buttons, forms, generatedAt: new Date().toISOString() };
+}
+
+async function sendSiteMapToWorker(map) {
+  if (!WORKER_URL) return;
+  try {
+    await fetch(`${WORKER_URL.replace(/\/+$/, "")}/sitemap`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(WORKER_SECRET ? { Authorization: `Bearer ${WORKER_SECRET}` } : {}),
+      },
+      body: JSON.stringify(map),
+    });
+  } catch {
+    // no-op
+  }
+}
+
+// ================= PAGE TYPE =================
+function detectPageType(url, title) {
   const u = (url || "").toLowerCase();
   const t = (title || "").toLowerCase();
 
@@ -357,18 +413,8 @@ function detectPageType(url: string, title: string) {
   return "general";
 }
 
-// PLACEHOLDER: these are referenced below; in your real file they already exist
-declare function extractStructured(page: any): Promise<any>;
-declare function extractSiteMapFromPage(page: any): Promise<any>;
-declare function enrichSiteMap(raw: any, siteId: string, base: string): any;
-declare function buildCombinedSiteMap(maps: any[], siteId: string, base: string): any;
-declare function sendSiteMapToWorker(map: any): Promise<void>;
-declare function normalizeNumbers(text: string): string;
-
-// ---- END: keep existing helpers ----
-
 // ================= PROCESS SINGLE PAGE =================
-async function processPage(page: any, url: string, base: string, stats: any, siteMaps: any[]) {
+async function processPage(page, url, base, stats, siteMaps) {
   const startTime = Date.now();
 
   try {
@@ -385,7 +431,7 @@ async function processPage(page: any, url: string, base: string, stats: any, sit
       }
       window.scrollTo(0, maxScroll);
 
-      document.querySelectorAll('img[loading="lazy"], img[data-src], img[data-lazy]').forEach((img: any) => {
+      document.querySelectorAll('img[loading="lazy"], img[data-src], img[data-lazy]').forEach((img) => {
         img.loading = "eager";
         if (img.dataset?.src) img.src = img.dataset.src;
         if (img.dataset?.lazy) img.src = img.dataset.lazy;
@@ -410,12 +456,12 @@ async function processPage(page: any, url: string, base: string, stats: any, sit
         siteMaps.push(rawSiteMap);
         console.log(`[SITEMAP] Page: ${rawSiteMap.buttons.length} buttons, ${rawSiteMap.forms.length} forms`);
       }
-    } catch (e: any) {
+    } catch (e) {
       console.error("[SITEMAP] Extract error:", e?.message || e);
     }
 
     const htmlContent = normalizeNumbers(clean(data.rawContent));
-    const ocrTexts = ocrResults.map((r: any) => r.text);
+    const ocrTexts = ocrResults.map((r) => r.text);
     const ocrContent = normalizeNumbers(clean(ocrTexts.join("\n\n")));
 
     const content = `
@@ -437,7 +483,6 @@ ${ocrContent}
 
     const links = await collectAllLinks(page, base);
 
-    // if too thin, skip saving but still return links
     if (pageType !== "services" && totalWords < MIN_WORDS) {
       return { links, page: null };
     }
@@ -454,7 +499,7 @@ ${ocrContent}
         status: "ok",
       },
     };
-  } catch (e: any) {
+  } catch (e) {
     console.error("[PAGE ERROR]", url, e?.message || e);
     stats.errors++;
     return { links: [], page: null };
@@ -462,7 +507,7 @@ ${ocrContent}
 }
 
 // ================= CRAWL =================
-async function crawlSmart(startUrl: string, siteId: string | null = null) {
+async function crawlSmart(startUrl, siteId = null) {
   const deadline = Date.now() + MAX_SECONDS * 1000;
   console.log("\n[CRAWL START]", startUrl);
   console.log(`[CONFIG] ${PARALLEL_TABS} tabs, ${PARALLEL_OCR} parallel OCR`);
@@ -476,15 +521,15 @@ async function crawlSmart(startUrl: string, siteId: string | null = null) {
   const stats = {
     visited: 0,
     saved: 0,
-    byType: {} as Record<string, number>,
+    byType: {},
     ocrElementsProcessed: 0,
     ocrCharsExtracted: 0,
     errors: 0,
   };
 
-  const pages: any[] = [];
-  const queue: string[] = [];
-  const siteMaps: any[] = [];
+  const pages = [];
+  const queue = [];
+  const siteMaps = [];
   let base = "";
 
   try {
@@ -497,7 +542,6 @@ async function crawlSmart(startUrl: string, siteId: string | null = null) {
     await initPage.goto(startUrl, { timeout: 10000, waitUntil: "domcontentloaded" });
     base = new URL(initPage.url()).origin;
 
-    // seed from current page links
     queue.push(normalizeUrl(initPage.url()));
     const initialLinks = await collectAllLinks(initPage, base);
     initialLinks.forEach((l) => {
@@ -505,7 +549,6 @@ async function crawlSmart(startUrl: string, siteId: string | null = null) {
       if (!visited.has(nl) && !SKIP_URL_RE.test(nl) && !queue.includes(nl)) queue.push(nl);
     });
 
-    // seed from sitemap (this is what unlocks "99 pages" sites)
     const sitemapUrls = await seedUrlsFromSitemap(base);
     if (sitemapUrls.length > 0) {
       console.log(`[SITEMAP] Seeded ${sitemapUrls.length} URLs from sitemap`);
@@ -529,10 +572,10 @@ async function crawlSmart(startUrl: string, siteId: string | null = null) {
       const pg = await ctx.newPage();
 
       while (Date.now() < deadline) {
-        let url: string | null = null;
+        let url = null;
 
         while (queue.length > 0) {
-          const candidate = queue.shift()!;
+          const candidate = queue.shift();
           const normalized = normalizeUrl(candidate);
           if (!visited.has(normalized) && !SKIP_URL_RE.test(normalized)) {
             visited.add(normalized);
@@ -555,7 +598,7 @@ async function crawlSmart(startUrl: string, siteId: string | null = null) {
           stats.saved++;
         }
 
-        result.links.forEach((l: string) => {
+        result.links.forEach((l) => {
           const nl = normalizeUrl(l);
           if (!visited.has(nl) && !SKIP_URL_RE.test(nl) && !queue.includes(nl)) queue.push(nl);
         });
@@ -572,7 +615,7 @@ async function crawlSmart(startUrl: string, siteId: string | null = null) {
     console.log(`[OCR STATS] ${stats.ocrElementsProcessed} images → ${stats.ocrCharsExtracted} chars`);
   }
 
-  let combinedSiteMap: any = null;
+  let combinedSiteMap = null;
   if (siteMaps.length > 0 && siteId) {
     console.log(`\n[SITEMAP] Building combined map from ${siteMaps.length} pages...`);
     const enrichedMaps = siteMaps.map((raw) => enrichSiteMap(raw, siteId, base));
@@ -591,9 +634,9 @@ function cleanupJobs() {
   }
 }
 
-function startJob({ url, site_id }: { url: string; site_id: string }) {
+function startJob({ url, site_id }) {
   const job_id = crypto.randomUUID();
-  const job: any = {
+  const job = {
     job_id,
     status: "queued",
     createdAt: Date.now(),
@@ -619,7 +662,7 @@ function startJob({ url, site_id }: { url: string; site_id: string }) {
       job.status = "ready";
       job.result = result;
       job.finishedAt = Date.now();
-    } catch (e: any) {
+    } catch (e) {
       job.status = "failed";
       job.error = e instanceof Error ? e.message : String(e);
       job.finishedAt = Date.now();
@@ -639,7 +682,6 @@ http
     const path = getPath(req);
     const q = getQuery(req);
 
-    // CORS preflight
     if (req.method === "OPTIONS") {
       res.writeHead(204, corsHeaders());
       return res.end();
@@ -647,10 +689,8 @@ http
 
     console.log(`[REQ] ${reqId} ${req.method} ${path}`);
 
-    // Health
     if (req.method === "GET" && path === "/health") return json(res, 200, { ok: true });
 
-    // Status
     if (req.method === "GET" && (path === "/" || path === "/status")) {
       return json(res, 200, {
         ok: true,
@@ -659,7 +699,6 @@ http
       });
     }
 
-    // Result
     if (req.method === "GET" && path === "/result") {
       if (!checkAuth(req, reqId)) return json(res, 401, { ok: false, error: "Unauthorized" });
 
@@ -668,7 +707,13 @@ http
       if (!job) return json(res, 404, { ok: false, error: "Job not found" });
 
       if (job.status === "queued" || job.status === "processing") {
-        return json(res, 202, { ok: true, status: job.status, job_id, url: job.url, site_id: job.site_id });
+        return json(res, 202, {
+          ok: true,
+          status: job.status,
+          job_id,
+          url: job.url,
+          site_id: job.site_id,
+        });
       }
 
       if (job.status === "failed") {
@@ -692,11 +737,10 @@ http
       });
     }
 
-    // Crawl (enqueue)
     if (req.method === "POST" && path === "/crawl") {
       if (!checkAuth(req, reqId)) return json(res, 401, { ok: false, error: "Unauthorized" });
 
-      let payload: any = {};
+      let payload = {};
       try {
         const body = await readBody(req);
         payload = JSON.parse(body || "{}");
@@ -706,15 +750,11 @@ http
 
       const url = typeof payload.url === "string" ? payload.url.trim() : "";
 
-      // accept both formats:
-      // old: site_id
-      // new: sessionId
       const site_id =
         (typeof payload.sessionId === "string" && payload.sessionId.trim()) ||
         (typeof payload.site_id === "string" && payload.site_id.trim()) ||
         "";
 
-      // optional: sessionToken check (if configured)
       const sessionToken = typeof payload.sessionToken === "string" ? payload.sessionToken.trim() : "";
       if (CRAWLER_TOKEN && sessionToken && sessionToken !== CRAWLER_TOKEN) {
         console.log(`[AUTH] ${reqId} sessionToken mismatch`);
