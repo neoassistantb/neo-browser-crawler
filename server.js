@@ -1,6 +1,8 @@
-import http from "http";
-import { chromium } from "playwright";
-import crypto from "crypto";
+"use strict";
+
+const http = require("http");
+const crypto = require("crypto");
+const { chromium } = require("playwright");
 
 const PORT = Number(process.env.PORT || 10000);
 
@@ -26,9 +28,10 @@ const MAX_OCR_CACHE = Number(process.env.MAX_OCR_CACHE || 400);
 
 // In-memory job store
 const JOB_TTL_MS = 15 * 60 * 1000;
-const jobs = new Map<string, any>();
-const visited = new Set<string>();
-const globalOcrCache = new Map<string, string>();
+const jobs = new Map();
+
+const visited = new Set();
+const globalOcrCache = new Map();
 
 const SKIP_URL_RE =
   /(wp-content\/uploads|media|gallery|video|photo|attachment|privacy|terms|cookies|gdpr)/i;
@@ -69,13 +72,13 @@ const clean = (t = "") =>
 
 const countWordsExact = (t = "") => (String(t).match(/[A-Za-zА-Яа-я0-9]+/g) || []).length;
 
-function getReqId(req: http.IncomingMessage) {
+function getReqId(req) {
   const v = req.headers["x-request-id"];
   if (typeof v === "string" && v.trim()) return v.trim();
   return crypto.randomUUID();
 }
 
-function getPath(req: http.IncomingMessage) {
+function getPath(req) {
   try {
     const u = new URL(req.url || "/", "http://localhost");
     return u.pathname;
@@ -84,7 +87,7 @@ function getPath(req: http.IncomingMessage) {
   }
 }
 
-function getQuery(req: http.IncomingMessage) {
+function getQuery(req) {
   try {
     const u = new URL(req.url || "/", "http://localhost");
     return u.searchParams;
@@ -93,15 +96,15 @@ function getQuery(req: http.IncomingMessage) {
   }
 }
 
-async function readBody(req: http.IncomingMessage) {
-  return await new Promise<string>((resolve) => {
+async function readBody(req) {
+  return await new Promise((resolve) => {
     let data = "";
     req.on("data", (c) => (data += c));
     req.on("end", () => resolve(data));
   });
 }
 
-function json(res: http.ServerResponse, status: number, obj: any) {
+function json(res, status, obj) {
   const body = JSON.stringify(obj);
   res.writeHead(status, {
     ...corsHeaders(),
@@ -110,7 +113,7 @@ function json(res: http.ServerResponse, status: number, obj: any) {
   res.end(body);
 }
 
-function normalizeUrl(u: string) {
+function normalizeUrl(u) {
   try {
     const url = new URL(u);
     url.hash = "";
@@ -121,19 +124,19 @@ function normalizeUrl(u: string) {
   }
 }
 
-function capText(s: string, maxChars: number) {
+function capText(s, maxChars) {
   const str = String(s || "");
   if (str.length <= maxChars) return str;
   return str.slice(0, maxChars) + "\n\n[TRUNCATED]";
 }
 
-function pushQueue(queue: string[], item: string) {
+function pushQueue(queue, item) {
   if (queue.length >= MAX_QUEUE) return;
   queue.push(item);
 }
 
 // ================= AUTH =================
-function checkAuth(req: http.IncomingMessage, reqId: string) {
+function checkAuth(req, reqId) {
   if (!CRAWLER_SECRET && !CRAWLER_TOKEN) return true;
 
   const auth = req.headers["authorization"];
@@ -156,8 +159,16 @@ function checkAuth(req: http.IncomingMessage, reqId: string) {
   return ok;
 }
 
+// ================= fetch fallback =================
+async function safeFetch(url, options) {
+  if (typeof fetch === "function") return await fetch(url, options);
+  // Node < 18 fallback (ако някога го пуснеш така)
+  const mod = await import("node-fetch");
+  return await mod.default(url, options);
+}
+
 // ================= OCR =================
-async function ocrImageUrl(imageUrl: string) {
+async function ocrImageUrl(imageUrl) {
   if (!GOOGLE_VISION_API_KEY) return "";
 
   try {
@@ -172,7 +183,7 @@ async function ocrImageUrl(imageUrl: string) {
       ],
     };
 
-    const r = await fetch(
+    const r = await safeFetch(
       `https://vision.googleapis.com/v1/images:annotate?key=${GOOGLE_VISION_API_KEY}`,
       {
         method: "POST",
@@ -183,8 +194,8 @@ async function ocrImageUrl(imageUrl: string) {
 
     const data = await r.json().catch(() => null);
     const text =
-      data?.responses?.[0]?.fullTextAnnotation?.text ||
-      data?.responses?.[0]?.textAnnotations?.[0]?.description ||
+      (data && data.responses && data.responses[0] && data.responses[0].fullTextAnnotation && data.responses[0].fullTextAnnotation.text) ||
+      (data && data.responses && data.responses[0] && data.responses[0].textAnnotations && data.responses[0].textAnnotations[0] && data.responses[0].textAnnotations[0].description) ||
       "";
 
     if (globalOcrCache.size >= MAX_OCR_CACHE) globalOcrCache.clear();
@@ -195,9 +206,9 @@ async function ocrImageUrl(imageUrl: string) {
   }
 }
 
-async function ocrAllImages(page: any, stats: any) {
+async function ocrAllImages(page, stats) {
   try {
-    const imgElements = await page.$$eval("img", (imgs: any[]) =>
+    const imgElements = await page.$$eval("img", (imgs) =>
       imgs
         .map((img) => ({
           src: img.currentSrc || img.src || img.getAttribute("src") || "",
@@ -214,7 +225,7 @@ async function ocrAllImages(page: any, stats: any) {
       return true;
     });
 
-    const results: string[] = [];
+    const results = [];
     let idx = 0;
 
     while (idx < validImages.length) {
@@ -225,7 +236,7 @@ async function ocrAllImages(page: any, stats: any) {
         try {
           const p = Promise.race([
             ocrImageUrl(img.src),
-            new Promise<string>((resolve) => setTimeout(() => resolve(""), OCR_TIMEOUT_MS)),
+            new Promise((resolve) => setTimeout(() => resolve(""), OCR_TIMEOUT_MS)),
           ]);
           const text = await p;
           if (text && String(text).trim().length > 0) {
@@ -248,16 +259,16 @@ async function ocrAllImages(page: any, stats: any) {
 }
 
 // ================= HEADER/FOOTER DEDUP CORE =================
-function normalizeLines(text: string) {
+function normalizeLines(text) {
   return clean(text)
     .split("\n")
     .map((l) => l.trim())
     .filter((l) => l.length >= 4);
 }
 
-function buildShellSignature(headerText: string, footerText: string) {
+function buildShellSignature(headerText, footerText) {
   const lines = [...normalizeLines(headerText), ...normalizeLines(footerText)];
-  const sig = new Set<string>();
+  const sig = new Set();
   for (const l of lines) {
     const s = l.replace(/\s+/g, " ").trim();
     if (!s) continue;
@@ -269,9 +280,9 @@ function buildShellSignature(headerText: string, footerText: string) {
   return sig;
 }
 
-function removeShellFromBody(bodyText: string, shellSig: Set<string>) {
+function removeShellFromBody(bodyText, shellSig) {
   const bodyLines = normalizeLines(bodyText);
-  const kept: string[] = [];
+  const kept = [];
 
   for (const l of bodyLines) {
     const key = l.replace(/\s+/g, " ").trim().toLowerCase();
@@ -279,7 +290,7 @@ function removeShellFromBody(bodyText: string, shellSig: Set<string>) {
     kept.push(l);
   }
 
-  const finalLines: string[] = [];
+  const finalLines = [];
   let prev = "";
   for (const l of kept) {
     const k = l.toLowerCase();
@@ -291,14 +302,14 @@ function removeShellFromBody(bodyText: string, shellSig: Set<string>) {
   return finalLines.join("\n");
 }
 
-async function getHeaderFooterText(page: any) {
+async function getHeaderFooterText(page) {
   try {
     return await page.evaluate(() => {
       const header = document.querySelector("header");
       const footer = document.querySelector("footer");
 
-      const headerText = header ? (header as any).innerText || "" : "";
-      const footerText = footer ? (footer as any).innerText || "" : "";
+      const headerText = header ? header.innerText || "" : "";
+      const footerText = footer ? footer.innerText || "" : "";
 
       return { headerText, footerText };
     });
@@ -307,13 +318,13 @@ async function getHeaderFooterText(page: any) {
   }
 }
 
-async function collectAllLinks(page: any, base: string) {
+async function collectAllLinks(page, base) {
   try {
-    return await page.evaluate((baseOrigin: string) => {
-      const urls = new Set<string>();
+    return await page.evaluate((baseOrigin) => {
+      const urls = new Set();
       document.querySelectorAll("a[href]").forEach((a) => {
         try {
-          const u = new URL((a as any).href, baseOrigin);
+          const u = new URL(a.href, baseOrigin);
           if (u.origin === baseOrigin) urls.add(u.href.split("#")[0]);
         } catch {}
       });
@@ -325,7 +336,7 @@ async function collectAllLinks(page: any, base: string) {
 }
 
 // ================= PROCESS PAGE =================
-async function processPage(page: any, url: string, base: string, shellSig: Set<string>, stats: any) {
+async function processPage(page, url, base, shellSig, stats) {
   const startTime = Date.now();
 
   try {
@@ -346,7 +357,7 @@ async function processPage(page: any, url: string, base: string, shellSig: Set<s
 
     const title = clean(await page.title());
 
-    const bodyTextRaw = await page.evaluate(() => (document.body ? (document.body as any).innerText || "" : ""));
+    const bodyTextRaw = await page.evaluate(() => (document.body ? document.body.innerText || "" : ""));
     const bodyTextCleaned = clean(bodyTextRaw);
 
     const bodyNoShell = removeShellFromBody(bodyTextRaw, shellSig);
@@ -356,13 +367,12 @@ async function processPage(page: any, url: string, base: string, shellSig: Set<s
     const cleanWords = countWordsExact(bodyNoShellCleaned);
 
     // SAFETY: if shell-removal nukes too much, keep raw body (still cleaned)
-    const effectiveBody =
-      rawWords > 0 && cleanWords < Math.floor(rawWords * 0.4) ? bodyTextCleaned : bodyNoShellCleaned;
+    const usedFallback = rawWords > 0 && cleanWords < Math.floor(rawWords * 0.4);
+    const effectiveBody = usedFallback ? bodyTextCleaned : bodyNoShellCleaned;
 
     const ocrTexts = await ocrAllImages(page, stats);
     const ocrClean = clean(ocrTexts.join("\n\n"));
 
-    // cap memory
     const cappedBody = capText(effectiveBody, Math.floor(MAX_CONTENT_CHARS * 0.75));
     const cappedOcr = capText(ocrClean, Math.floor(MAX_CONTENT_CHARS * 0.25));
 
@@ -379,7 +389,6 @@ ${cappedOcr}
     const words = countWordsExact(cappedBody) + countWordsExact(cappedOcr);
     const elapsed = Date.now() - startTime;
 
-    const usedFallback = rawWords > 0 && cleanWords < Math.floor(rawWords * 0.4);
     console.log(
       `[PAGE] ✓ words=${words} rawWords=${rawWords} shellCleanWords=${cleanWords} fallbackRaw=${usedFallback} ocr_imgs=${ocrTexts.length} ocr_chars=${ocrClean.length} ${elapsed}ms`,
     );
@@ -401,15 +410,15 @@ ${cappedOcr}
         status: "ok",
       },
     };
-  } catch (e: any) {
-    console.error("[PAGE ERROR]", url, e?.message || e);
+  } catch (e) {
+    console.error("[PAGE ERROR]", url, e && e.message ? e.message : e);
     stats.errors++;
     return { links: [], page: null };
   }
 }
 
-// ================= CRAWL (NO SITEMAP) =================
-async function crawlSmart(startUrl: string, siteId: string | null = null) {
+// ================= CRAWL =================
+async function crawlSmart(startUrl, siteId) {
   const deadline = Date.now() + MAX_SECONDS * 1000;
   console.log("\n[CRAWL START]", startUrl);
   console.log(`[CONFIG] tabs=${PARALLEL_TABS} max_pages=${MAX_PAGES} max_queue=${MAX_QUEUE} MIN_WORDS=${MIN_WORDS}`);
@@ -428,12 +437,12 @@ async function crawlSmart(startUrl: string, siteId: string | null = null) {
     errors: 0,
   };
 
-  const pages: any[] = [];
-  const queue: string[] = [];
+  const pages = [];
+  const queue = [];
   let base = "";
 
   let siteShell = { header: "", footer: "" };
-  let shellSig = new Set<string>();
+  let shellSig = new Set();
 
   try {
     const initContext = await browser.newContext({
@@ -445,7 +454,6 @@ async function crawlSmart(startUrl: string, siteId: string | null = null) {
     await initPage.goto(startUrl, { timeout: 15000, waitUntil: "domcontentloaded" });
     base = new URL(initPage.url()).origin;
 
-    // capture header/footer ONCE
     const shell = await getHeaderFooterText(initPage);
     siteShell = {
       header: clean(shell.headerText),
@@ -457,7 +465,6 @@ async function crawlSmart(startUrl: string, siteId: string | null = null) {
       `[SHELL] header=${siteShell.header.length} chars footer=${siteShell.footer.length} chars sig=${shellSig.size} lines`,
     );
 
-    // seed queue from the first page only
     const seedUrl = normalizeUrl(initPage.url());
     pushQueue(queue, seedUrl);
 
@@ -479,15 +486,15 @@ async function crawlSmart(startUrl: string, siteId: string | null = null) {
       userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     });
 
-    const createWorker = async (idx: number) => {
+    const createWorker = async (idx) => {
       const pg = await sharedContext.newPage();
 
       while (Date.now() < deadline) {
         if (pages.length >= MAX_PAGES) break;
 
-        let url: string | null = null;
+        let url = null;
         while (queue.length > 0) {
-          const candidate = queue.shift() as string;
+          const candidate = queue.shift();
           const normalized = normalizeUrl(candidate);
           if (!visited.has(normalized) && !SKIP_URL_RE.test(normalized)) {
             visited.add(normalized);
@@ -546,18 +553,18 @@ function cleanupJobs() {
   }
 }
 
-function startJob({ url, site_id }: { url: string; site_id: string }) {
+function startJob({ url, site_id }) {
   const job_id = crypto.randomUUID();
   const job = {
     job_id,
     status: "queued",
     createdAt: Date.now(),
-    startedAt: null as number | null,
-    finishedAt: null as number | null,
+    startedAt: null,
+    finishedAt: null,
     url,
     site_id,
-    result: null as any,
-    error: null as string | null,
+    result: null,
+    error: null,
   };
   jobs.set(job_id, job);
 
@@ -578,9 +585,9 @@ function startJob({ url, site_id }: { url: string; site_id: string }) {
       job.result = result;
       job.finishedAt = Date.now();
       console.log(
-        `[JOB] done job_id=${job_id} status=ready saved=${result?.stats?.saved} visited=${result?.stats?.visited}`,
+        `[JOB] done job_id=${job_id} status=ready saved=${result && result.stats ? result.stats.saved : 0} visited=${result && result.stats ? result.stats.visited : 0}`,
       );
-    } catch (e: any) {
+    } catch (e) {
       job.status = "failed";
       job.error = e instanceof Error ? e.message : String(e);
       job.finishedAt = Date.now();
@@ -639,7 +646,7 @@ http
     if (req.method === "POST" && path === "/crawl") {
       if (!checkAuth(req, reqId)) return json(res, 401, { ok: false, error: "Unauthorized" });
 
-      let payload: any = {};
+      let payload = {};
       try {
         const body = await readBody(req);
         payload = JSON.parse(body || "{}");
