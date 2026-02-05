@@ -26,9 +26,9 @@ const MAX_OCR_CACHE = Number(process.env.MAX_OCR_CACHE || 400);
 
 // In-memory job store
 const JOB_TTL_MS = 15 * 60 * 1000;
-const jobs = new Map();
-const visited = new Set();
-const globalOcrCache = new Map();
+const jobs = new Map<string, any>();
+const visited = new Set<string>();
+const globalOcrCache = new Map<string, string>();
 
 const SKIP_URL_RE =
   /(wp-content\/uploads|media|gallery|video|photo|attachment|privacy|terms|cookies|gdpr)/i;
@@ -36,6 +36,13 @@ const SKIP_URL_RE =
 const SKIP_OCR_RE = /\/(logo|favicon|spinner|avatar|pixel|spacer|blank|transparent)\.|\/icons?\//i;
 
 console.log(`[BOOT] neo-browser-crawler starting... PORT=${PORT}`);
+console.log(
+  `[BOOT] limits: MAX_SECONDS=${MAX_SECONDS} MIN_WORDS=${MIN_WORDS} PARALLEL_TABS=${PARALLEL_TABS} PARALLEL_OCR=${PARALLEL_OCR} MAX_PAGES=${MAX_PAGES}`,
+);
+console.log(
+  `[BOOT] auth: CRAWLER_SECRET=${CRAWLER_SECRET ? "set" : "unset"} CRAWLER_TOKEN=${CRAWLER_TOKEN ? "set" : "unset"} GOOGLE_VISION_API_KEY=${GOOGLE_VISION_API_KEY ? "set" : "unset"}`,
+);
+
 setInterval(() => {
   const m = process.memoryUsage();
   console.log(
@@ -62,39 +69,39 @@ const clean = (t = "") =>
 
 const countWordsExact = (t = "") => (String(t).match(/[A-Za-zА-Яа-я0-9]+/g) || []).length;
 
-function getReqId(req) {
+function getReqId(req: http.IncomingMessage) {
   const v = req.headers["x-request-id"];
   if (typeof v === "string" && v.trim()) return v.trim();
   return crypto.randomUUID();
 }
 
-function getPath(req) {
+function getPath(req: http.IncomingMessage) {
   try {
-    const u = new URL(req.url, "http://localhost");
+    const u = new URL(req.url || "/", "http://localhost");
     return u.pathname;
   } catch {
     return "/";
   }
 }
 
-function getQuery(req) {
+function getQuery(req: http.IncomingMessage) {
   try {
-    const u = new URL(req.url, "http://localhost");
+    const u = new URL(req.url || "/", "http://localhost");
     return u.searchParams;
   } catch {
     return new URLSearchParams();
   }
 }
 
-async function readBody(req) {
-  return await new Promise((resolve) => {
+async function readBody(req: http.IncomingMessage) {
+  return await new Promise<string>((resolve) => {
     let data = "";
     req.on("data", (c) => (data += c));
     req.on("end", () => resolve(data));
   });
 }
 
-function json(res, status, obj) {
+function json(res: http.ServerResponse, status: number, obj: any) {
   const body = JSON.stringify(obj);
   res.writeHead(status, {
     ...corsHeaders(),
@@ -103,7 +110,7 @@ function json(res, status, obj) {
   res.end(body);
 }
 
-function normalizeUrl(u) {
+function normalizeUrl(u: string) {
   try {
     const url = new URL(u);
     url.hash = "";
@@ -114,19 +121,19 @@ function normalizeUrl(u) {
   }
 }
 
-function capText(s, maxChars) {
+function capText(s: string, maxChars: number) {
   const str = String(s || "");
   if (str.length <= maxChars) return str;
   return str.slice(0, maxChars) + "\n\n[TRUNCATED]";
 }
 
-function pushQueue(queue, item) {
+function pushQueue(queue: string[], item: string) {
   if (queue.length >= MAX_QUEUE) return;
   queue.push(item);
 }
 
 // ================= AUTH =================
-function checkAuth(req, reqId) {
+function checkAuth(req: http.IncomingMessage, reqId: string) {
   if (!CRAWLER_SECRET && !CRAWLER_TOKEN) return true;
 
   const auth = req.headers["authorization"];
@@ -143,16 +150,18 @@ function checkAuth(req, reqId) {
     (CRAWLER_SECRET && bearer === CRAWLER_SECRET) ||
     (CRAWLER_TOKEN && (bearer === CRAWLER_TOKEN || token === CRAWLER_TOKEN));
 
-  if (!ok) console.log(`[AUTH] ${reqId} Unauthorized`);
+  if (!ok) {
+    console.log(`[AUTH] ${reqId} Unauthorized (hasAuthHeader=${!!auth} hasTokenHeader=${!!tokenHeader})`);
+  }
   return ok;
 }
 
 // ================= OCR =================
-async function ocrImageUrl(imageUrl) {
+async function ocrImageUrl(imageUrl: string) {
   if (!GOOGLE_VISION_API_KEY) return "";
 
   try {
-    if (globalOcrCache.has(imageUrl)) return globalOcrCache.get(imageUrl);
+    if (globalOcrCache.has(imageUrl)) return globalOcrCache.get(imageUrl) || "";
 
     const body = {
       requests: [
@@ -186,9 +195,9 @@ async function ocrImageUrl(imageUrl) {
   }
 }
 
-async function ocrAllImages(page, stats) {
+async function ocrAllImages(page: any, stats: any) {
   try {
-    const imgElements = await page.$$eval("img", (imgs) =>
+    const imgElements = await page.$$eval("img", (imgs: any[]) =>
       imgs
         .map((img) => ({
           src: img.currentSrc || img.src || img.getAttribute("src") || "",
@@ -205,7 +214,7 @@ async function ocrAllImages(page, stats) {
       return true;
     });
 
-    const results = [];
+    const results: string[] = [];
     let idx = 0;
 
     while (idx < validImages.length) {
@@ -216,7 +225,7 @@ async function ocrAllImages(page, stats) {
         try {
           const p = Promise.race([
             ocrImageUrl(img.src),
-            new Promise((resolve) => setTimeout(() => resolve(""), OCR_TIMEOUT_MS)),
+            new Promise<string>((resolve) => setTimeout(() => resolve(""), OCR_TIMEOUT_MS)),
           ]);
           const text = await p;
           if (text && String(text).trim().length > 0) {
@@ -239,21 +248,16 @@ async function ocrAllImages(page, stats) {
 }
 
 // ================= HEADER/FOOTER DEDUP CORE =================
-
-// normalize text into lines, remove empty/noisy short lines
-function normalizeLines(text) {
+function normalizeLines(text: string) {
   return clean(text)
     .split("\n")
     .map((l) => l.trim())
     .filter((l) => l.length >= 4);
 }
 
-// Build a signature set from header/footer lines (to remove later)
-function buildShellSignature(headerText, footerText) {
+function buildShellSignature(headerText: string, footerText: string) {
   const lines = [...normalizeLines(headerText), ...normalizeLines(footerText)];
-
-  // keep only the strongest "repeating" candidates (not too long, not pure numbers)
-  const sig = new Set();
+  const sig = new Set<string>();
   for (const l of lines) {
     const s = l.replace(/\s+/g, " ").trim();
     if (!s) continue;
@@ -265,10 +269,9 @@ function buildShellSignature(headerText, footerText) {
   return sig;
 }
 
-// Remove lines that exist in shell signature
-function removeShellFromBody(bodyText, shellSig) {
+function removeShellFromBody(bodyText: string, shellSig: Set<string>) {
   const bodyLines = normalizeLines(bodyText);
-  const kept = [];
+  const kept: string[] = [];
 
   for (const l of bodyLines) {
     const key = l.replace(/\s+/g, " ").trim().toLowerCase();
@@ -276,8 +279,7 @@ function removeShellFromBody(bodyText, shellSig) {
     kept.push(l);
   }
 
-  // additional cleanup: remove duplicated consecutive lines
-  const finalLines = [];
+  const finalLines: string[] = [];
   let prev = "";
   for (const l of kept) {
     const k = l.toLowerCase();
@@ -289,14 +291,14 @@ function removeShellFromBody(bodyText, shellSig) {
   return finalLines.join("\n");
 }
 
-async function getHeaderFooterText(page) {
+async function getHeaderFooterText(page: any) {
   try {
     return await page.evaluate(() => {
       const header = document.querySelector("header");
       const footer = document.querySelector("footer");
 
-      const headerText = header ? (header.innerText || "") : "";
-      const footerText = footer ? (footer.innerText || "") : "";
+      const headerText = header ? (header as any).innerText || "" : "";
+      const footerText = footer ? (footer as any).innerText || "" : "";
 
       return { headerText, footerText };
     });
@@ -305,13 +307,13 @@ async function getHeaderFooterText(page) {
   }
 }
 
-async function collectAllLinks(page, base) {
+async function collectAllLinks(page: any, base: string) {
   try {
-    return await page.evaluate((baseOrigin) => {
-      const urls = new Set();
+    return await page.evaluate((baseOrigin: string) => {
+      const urls = new Set<string>();
       document.querySelectorAll("a[href]").forEach((a) => {
         try {
-          const u = new URL(a.href, baseOrigin);
+          const u = new URL((a as any).href, baseOrigin);
           if (u.origin === baseOrigin) urls.add(u.href.split("#")[0]);
         } catch {}
       });
@@ -323,7 +325,7 @@ async function collectAllLinks(page, base) {
 }
 
 // ================= PROCESS PAGE =================
-async function processPage(page, url, base, shellSig, stats) {
+async function processPage(page: any, url: string, base: string, shellSig: Set<string>, stats: any) {
   const startTime = Date.now();
 
   try {
@@ -333,7 +335,7 @@ async function processPage(page, url, base, shellSig, stats) {
     // quick scroll to trigger lazy content
     await page.evaluate(async () => {
       const scrollStep = Math.max(400, Math.floor(window.innerHeight * 0.9));
-      const maxScroll = document.body.scrollHeight;
+      const maxScroll = document.body ? document.body.scrollHeight : 0;
       for (let pos = 0; pos < maxScroll; pos += scrollStep) {
         window.scrollTo(0, pos);
         await new Promise((r) => setTimeout(r, 60));
@@ -344,14 +346,24 @@ async function processPage(page, url, base, shellSig, stats) {
 
     const title = clean(await page.title());
 
-    const bodyText = await page.evaluate(() => (document.body ? document.body.innerText || "" : ""));
-    const bodyClean = removeShellFromBody(bodyText, shellSig);
+    const bodyTextRaw = await page.evaluate(() => (document.body ? (document.body as any).innerText || "" : ""));
+    const bodyTextCleaned = clean(bodyTextRaw);
+
+    const bodyNoShell = removeShellFromBody(bodyTextRaw, shellSig);
+    const bodyNoShellCleaned = clean(bodyNoShell);
+
+    const rawWords = countWordsExact(bodyTextCleaned);
+    const cleanWords = countWordsExact(bodyNoShellCleaned);
+
+    // SAFETY: if shell-removal nukes too much, keep raw body (still cleaned)
+    const effectiveBody =
+      rawWords > 0 && cleanWords < Math.floor(rawWords * 0.4) ? bodyTextCleaned : bodyNoShellCleaned;
 
     const ocrTexts = await ocrAllImages(page, stats);
     const ocrClean = clean(ocrTexts.join("\n\n"));
 
     // cap memory
-    const cappedBody = capText(bodyClean, Math.floor(MAX_CONTENT_CHARS * 0.75));
+    const cappedBody = capText(effectiveBody, Math.floor(MAX_CONTENT_CHARS * 0.75));
     const cappedOcr = capText(ocrClean, Math.floor(MAX_CONTENT_CHARS * 0.25));
 
     const content = `
@@ -367,11 +379,15 @@ ${cappedOcr}
     const words = countWordsExact(cappedBody) + countWordsExact(cappedOcr);
     const elapsed = Date.now() - startTime;
 
-    console.log(`[PAGE] ✓ words=${words} ocr_imgs=${ocrTexts.length} ${elapsed}ms`);
+    const usedFallback = rawWords > 0 && cleanWords < Math.floor(rawWords * 0.4);
+    console.log(
+      `[PAGE] ✓ words=${words} rawWords=${rawWords} shellCleanWords=${cleanWords} fallbackRaw=${usedFallback} ocr_imgs=${ocrTexts.length} ocr_chars=${ocrClean.length} ${elapsed}ms`,
+    );
 
     const links = await collectAllLinks(page, base);
 
     if (words < MIN_WORDS) {
+      console.log(`[DROP] url=${url} reason=MIN_WORDS words=${words} MIN_WORDS=${MIN_WORDS} links_found=${links.length}`);
       return { links, page: null };
     }
 
@@ -385,7 +401,7 @@ ${cappedOcr}
         status: "ok",
       },
     };
-  } catch (e) {
+  } catch (e: any) {
     console.error("[PAGE ERROR]", url, e?.message || e);
     stats.errors++;
     return { links: [], page: null };
@@ -393,10 +409,10 @@ ${cappedOcr}
 }
 
 // ================= CRAWL (NO SITEMAP) =================
-async function crawlSmart(startUrl, siteId = null) {
+async function crawlSmart(startUrl: string, siteId: string | null = null) {
   const deadline = Date.now() + MAX_SECONDS * 1000;
   console.log("\n[CRAWL START]", startUrl);
-  console.log(`[CONFIG] tabs=${PARALLEL_TABS} max_pages=${MAX_PAGES} max_queue=${MAX_QUEUE}`);
+  console.log(`[CONFIG] tabs=${PARALLEL_TABS} max_pages=${MAX_PAGES} max_queue=${MAX_QUEUE} MIN_WORDS=${MIN_WORDS}`);
   if (siteId) console.log(`[SITE ID] ${siteId}`);
 
   const browser = await chromium.launch({
@@ -412,12 +428,12 @@ async function crawlSmart(startUrl, siteId = null) {
     errors: 0,
   };
 
-  const pages = [];
-  const queue = [];
+  const pages: any[] = [];
+  const queue: string[] = [];
   let base = "";
 
   let siteShell = { header: "", footer: "" };
-  let shellSig = new Set();
+  let shellSig = new Set<string>();
 
   try {
     const initContext = await browser.newContext({
@@ -437,11 +453,17 @@ async function crawlSmart(startUrl, siteId = null) {
     };
     shellSig = buildShellSignature(siteShell.header, siteShell.footer);
 
-    console.log(`[SHELL] header=${siteShell.header.length} chars footer=${siteShell.footer.length} chars sig=${shellSig.size} lines`);
+    console.log(
+      `[SHELL] header=${siteShell.header.length} chars footer=${siteShell.footer.length} chars sig=${shellSig.size} lines`,
+    );
 
     // seed queue from the first page only
-    pushQueue(queue, normalizeUrl(initPage.url()));
+    const seedUrl = normalizeUrl(initPage.url());
+    pushQueue(queue, seedUrl);
+
     const initialLinks = await collectAllLinks(initPage, base);
+    console.log(`[CRAWL] seed=${seedUrl} initial_links=${initialLinks.length}`);
+
     for (const l of initialLinks) {
       const nl = normalizeUrl(l);
       if (!visited.has(nl) && !SKIP_URL_RE.test(nl) && !queue.includes(nl)) pushQueue(queue, nl);
@@ -457,15 +479,15 @@ async function crawlSmart(startUrl, siteId = null) {
       userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     });
 
-    const createWorker = async (idx) => {
+    const createWorker = async (idx: number) => {
       const pg = await sharedContext.newPage();
 
       while (Date.now() < deadline) {
         if (pages.length >= MAX_PAGES) break;
 
-        let url = null;
+        let url: string | null = null;
         while (queue.length > 0) {
-          const candidate = queue.shift();
+          const candidate = queue.shift() as string;
           const normalized = normalizeUrl(candidate);
           if (!visited.has(normalized) && !SKIP_URL_RE.test(normalized)) {
             visited.add(normalized);
@@ -495,7 +517,9 @@ async function crawlSmart(startUrl, siteId = null) {
         }
 
         if (stats.visited % 10 === 0) {
-          console.log(`[PROGRESS] visited=${stats.visited} saved=${stats.saved} queue=${queue.length} pages_in_mem=${pages.length} worker=${idx}`);
+          console.log(
+            `[PROGRESS] visited=${stats.visited} saved=${stats.saved} queue=${queue.length} pages_in_mem=${pages.length} worker=${idx} ocr_el=${stats.ocrElementsProcessed} ocr_chars=${stats.ocrCharsExtracted} errors=${stats.errors}`,
+          );
         }
       }
 
@@ -506,7 +530,9 @@ async function crawlSmart(startUrl, siteId = null) {
     await sharedContext.close();
   } finally {
     await browser.close();
-    console.log(`\n[CRAWL DONE] saved=${stats.saved} visited=${stats.visited} queue_left=${queue.length}`);
+    console.log(
+      `\n[CRAWL DONE] saved=${stats.saved} visited=${stats.visited} queue_left=${queue.length} ocr_el=${stats.ocrElementsProcessed} ocr_chars=${stats.ocrCharsExtracted} errors=${stats.errors}`,
+    );
   }
 
   return { siteShell, pages, stats };
@@ -520,20 +546,22 @@ function cleanupJobs() {
   }
 }
 
-function startJob({ url, site_id }) {
+function startJob({ url, site_id }: { url: string; site_id: string }) {
   const job_id = crypto.randomUUID();
   const job = {
     job_id,
     status: "queued",
     createdAt: Date.now(),
-    startedAt: null,
-    finishedAt: null,
+    startedAt: null as number | null,
+    finishedAt: null as number | null,
     url,
     site_id,
-    result: null,
-    error: null,
+    result: null as any,
+    error: null as string | null,
   };
   jobs.set(job_id, job);
+
+  console.log(`[JOB] created job_id=${job_id} url=${url} site_id=${site_id || "null"}`);
 
   (async () => {
     cleanupJobs();
@@ -542,16 +570,21 @@ function startJob({ url, site_id }) {
 
     job.status = "processing";
     job.startedAt = Date.now();
+    console.log(`[JOB] start job_id=${job_id}`);
 
     try {
       const result = await crawlSmart(url, site_id || null);
       job.status = "ready";
       job.result = result;
       job.finishedAt = Date.now();
-    } catch (e) {
+      console.log(
+        `[JOB] done job_id=${job_id} status=ready saved=${result?.stats?.saved} visited=${result?.stats?.visited}`,
+      );
+    } catch (e: any) {
       job.status = "failed";
       job.error = e instanceof Error ? e.message : String(e);
       job.finishedAt = Date.now();
+      console.log(`[JOB] done job_id=${job_id} status=failed error=${job.error}`);
     }
   })();
 
@@ -578,7 +611,11 @@ http
     if (req.method === "GET" && path === "/health") return json(res, 200, { ok: true });
 
     if (req.method === "GET" && (path === "/" || path === "/status")) {
-      return json(res, 200, { ok: true, jobs: jobs.size });
+      return json(res, 200, {
+        ok: true,
+        jobs: jobs.size,
+        hint: "POST /crawl { url, sessionId|site_id, sessionToken? } then GET /result?job_id=...",
+      });
     }
 
     if (req.method === "GET" && path === "/result") {
@@ -602,7 +639,7 @@ http
     if (req.method === "POST" && path === "/crawl") {
       if (!checkAuth(req, reqId)) return json(res, 401, { ok: false, error: "Unauthorized" });
 
-      let payload = {};
+      let payload: any = {};
       try {
         const body = await readBody(req);
         payload = JSON.parse(body || "{}");
@@ -624,6 +661,7 @@ http
 
       if (!url) return json(res, 400, { ok: false, error: "Missing url" });
 
+      console.log(`[CRAWL] accepted reqId=${reqId} url=${url} site_id=${site_id || "null"}`);
       const job_id = startJob({ url, site_id });
       return json(res, 202, { ok: true, accepted: true, job_id, status: "queued", url, site_id });
     }
