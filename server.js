@@ -26,7 +26,7 @@ const OCR_TIMEOUT_MS = 6000;
 const JOB_TTL_MS = 15 * 60 * 1000;
 const jobs = new Map();
 const visited = new Set();
-const globalOcrCache = new Map<string, any>();
+const globalOcrCache = new Map();
 
 const SKIP_URL_RE =
   /(wp-content\/uploads|media|gallery|video|photo|attachment|privacy|terms|cookies|gdpr)/i;
