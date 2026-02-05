@@ -8,23 +8,25 @@ const PORT = Number(process.env.PORT || 10000);
 const CRAWLER_SECRET = process.env.CRAWLER_SECRET || "";
 const CRAWLER_TOKEN = process.env.CRAWLER_TOKEN || "";
 
-// OCR
+// OCR (optional)
 const GOOGLE_VISION_API_KEY = process.env.GOOGLE_VISION_API_KEY || "";
 
-// Worker (optional)
-const WORKER_URL = process.env.NEO_WORKER_URL || "";
-const WORKER_SECRET = process.env.NEO_WORKER_SECRET || "";
-
 // ================= LIMITS =================
-const MAX_SECONDS = 180;
-const MIN_WORDS = 20;
-const PARALLEL_TABS = 5;
-const PARALLEL_OCR = 10;
-const OCR_TIMEOUT_MS = 6000;
+const MAX_SECONDS = Number(process.env.MAX_SECONDS || 180);
+const MIN_WORDS = Number(process.env.MIN_WORDS || 20);
+
+const PARALLEL_TABS = Number(process.env.PARALLEL_TABS || 2);
+const PARALLEL_OCR = Number(process.env.PARALLEL_OCR || 6);
+const OCR_TIMEOUT_MS = Number(process.env.OCR_TIMEOUT_MS || 6000);
+
+const MAX_PAGES = Number(process.env.MAX_PAGES || 120);
+const MAX_QUEUE = Number(process.env.MAX_QUEUE || 1200);
+const MAX_CONTENT_CHARS = Number(process.env.MAX_CONTENT_CHARS || 70000);
+const MAX_OCR_CACHE = Number(process.env.MAX_OCR_CACHE || 400);
 
 // In-memory job store
 const JOB_TTL_MS = 15 * 60 * 1000;
-const jobs = new Map(); // job_id -> job
+const jobs = new Map();
 const visited = new Set();
 const globalOcrCache = new Map();
 
@@ -32,6 +34,14 @@ const SKIP_URL_RE =
   /(wp-content\/uploads|media|gallery|video|photo|attachment|privacy|terms|cookies|gdpr)/i;
 
 const SKIP_OCR_RE = /\/(logo|favicon|spinner|avatar|pixel|spacer|blank|transparent)\.|\/icons?\//i;
+
+console.log(`[BOOT] neo-browser-crawler starting... PORT=${PORT}`);
+setInterval(() => {
+  const m = process.memoryUsage();
+  console.log(
+    `[MEM] rss=${Math.round(m.rss / 1024 / 1024)}MB heapUsed=${Math.round(m.heapUsed / 1024 / 1024)}MB`,
+  );
+}, 10_000);
 
 // ================= CORS =================
 function corsHeaders() {
@@ -104,6 +114,17 @@ function normalizeUrl(u) {
   }
 }
 
+function capText(s, maxChars) {
+  const str = String(s || "");
+  if (str.length <= maxChars) return str;
+  return str.slice(0, maxChars) + "\n\n[TRUNCATED]";
+}
+
+function pushQueue(queue, item) {
+  if (queue.length >= MAX_QUEUE) return;
+  queue.push(item);
+}
+
 // ================= AUTH =================
 function checkAuth(req, reqId) {
   if (!CRAWLER_SECRET && !CRAWLER_TOKEN) return true;
@@ -122,83 +143,8 @@ function checkAuth(req, reqId) {
     (CRAWLER_SECRET && bearer === CRAWLER_SECRET) ||
     (CRAWLER_TOKEN && (bearer === CRAWLER_TOKEN || token === CRAWLER_TOKEN));
 
-  if (!ok) console.log(`[AUTH] ${reqId} Unauthorized (missing/invalid token)`);
+  if (!ok) console.log(`[AUTH] ${reqId} Unauthorized`);
   return ok;
-}
-
-// ================= SIMPLE SITEMAP FETCH =================
-async function fetchWithTimeout(url, ms) {
-  const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), ms);
-  try {
-    return await fetch(url, { signal: controller.signal });
-  } finally {
-    clearTimeout(t);
-  }
-}
-
-function extractLocs(xml) {
-  const out = [];
-  const re = /<loc>\s*([^<]+)\s*<\/loc>/gi;
-  let m;
-  while ((m = re.exec(xml))) {
-    const v = (m[1] || "").trim();
-    if (v) out.push(v);
-  }
-  return out;
-}
-
-async function seedUrlsFromSitemap(baseOrigin) {
-  const candidates = [
-    `${baseOrigin}/sitemap.xml`,
-    `${baseOrigin}/sitemap_index.xml`,
-    `${baseOrigin}/sitemap-index.xml`,
-  ];
-
-  const seenSitemaps = new Set();
-  const foundUrls = [];
-
-  async function readSitemap(sitemapUrl, depth) {
-    if (depth > 2) return;
-    if (seenSitemaps.has(sitemapUrl)) return;
-    seenSitemaps.add(sitemapUrl);
-
-    try {
-      const r = await fetchWithTimeout(sitemapUrl, 8000);
-      if (!r.ok) return;
-      const xml = await r.text();
-      const locs = extractLocs(xml);
-
-      const xmlLinks = locs.filter((l) => /\.xml(\?|$)/i.test(l));
-      if (xmlLinks.length > 0) {
-        for (const child of xmlLinks.slice(0, 50)) {
-          await readSitemap(child, depth + 1);
-        }
-        return;
-      }
-
-      for (const u of locs) foundUrls.push(u);
-    } catch {
-      // ignore
-    }
-  }
-
-  for (const s of candidates) {
-    await readSitemap(s, 0);
-    if (foundUrls.length > 0) break;
-  }
-
-  const normalized = new Set();
-  for (const u of foundUrls) {
-    try {
-      const x = new URL(u);
-      if (x.origin !== baseOrigin) continue;
-      const nu = normalizeUrl(x.toString());
-      if (!SKIP_URL_RE.test(nu)) normalized.add(nu);
-    } catch {}
-  }
-
-  return Array.from(normalized);
 }
 
 // ================= OCR =================
@@ -232,6 +178,7 @@ async function ocrImageUrl(imageUrl) {
       data?.responses?.[0]?.textAnnotations?.[0]?.description ||
       "";
 
+    if (globalOcrCache.size >= MAX_OCR_CACHE) globalOcrCache.clear();
     globalOcrCache.set(imageUrl, text || "");
     return text || "";
   } catch {
@@ -247,7 +194,6 @@ async function ocrAllImages(page, stats) {
           src: img.currentSrc || img.src || img.getAttribute("src") || "",
           w: img.naturalWidth || img.width || 0,
           h: img.naturalHeight || img.height || 0,
-          alt: img.alt || "",
         }))
         .filter((x) => x.src),
     );
@@ -258,8 +204,6 @@ async function ocrAllImages(page, stats) {
       if (img.w < 80 || img.h < 60) return false;
       return true;
     });
-
-    console.log(`[OCR] ${validImages.length}/${imgElements.length} images to process`);
 
     const results = [];
     let idx = 0;
@@ -274,31 +218,93 @@ async function ocrAllImages(page, stats) {
             ocrImageUrl(img.src),
             new Promise((resolve) => setTimeout(() => resolve(""), OCR_TIMEOUT_MS)),
           ]);
-
           const text = await p;
           if (text && String(text).trim().length > 0) {
             stats.ocrElementsProcessed++;
             stats.ocrCharsExtracted += text.length;
-            return { text, src: img.src, alt: img.alt };
+            return text;
           }
-        } catch {
-          // ignore
-        }
-        return null;
+        } catch {}
+        return "";
       });
 
       const batchResults = await Promise.all(batchPromises);
-      results.push(...batchResults.filter((r) => r !== null));
+      for (const t of batchResults) if (t) results.push(t);
     }
 
     return results;
-  } catch (e) {
-    console.error("[OCR ERROR]", e?.message || e);
+  } catch {
     return [];
   }
 }
 
-// ================= LINK DISCOVERY =================
+// ================= HEADER/FOOTER DEDUP CORE =================
+
+// normalize text into lines, remove empty/noisy short lines
+function normalizeLines(text) {
+  return clean(text)
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l.length >= 4);
+}
+
+// Build a signature set from header/footer lines (to remove later)
+function buildShellSignature(headerText, footerText) {
+  const lines = [...normalizeLines(headerText), ...normalizeLines(footerText)];
+
+  // keep only the strongest "repeating" candidates (not too long, not pure numbers)
+  const sig = new Set();
+  for (const l of lines) {
+    const s = l.replace(/\s+/g, " ").trim();
+    if (!s) continue;
+    if (s.length < 6) continue;
+    if (s.length > 120) continue;
+    if (/^[0-9\s\-\+]+$/.test(s)) continue;
+    sig.add(s.toLowerCase());
+  }
+  return sig;
+}
+
+// Remove lines that exist in shell signature
+function removeShellFromBody(bodyText, shellSig) {
+  const bodyLines = normalizeLines(bodyText);
+  const kept = [];
+
+  for (const l of bodyLines) {
+    const key = l.replace(/\s+/g, " ").trim().toLowerCase();
+    if (shellSig.has(key)) continue;
+    kept.push(l);
+  }
+
+  // additional cleanup: remove duplicated consecutive lines
+  const finalLines = [];
+  let prev = "";
+  for (const l of kept) {
+    const k = l.toLowerCase();
+    if (k === prev) continue;
+    finalLines.push(l);
+    prev = k;
+  }
+
+  return finalLines.join("\n");
+}
+
+async function getHeaderFooterText(page) {
+  try {
+    return await page.evaluate(() => {
+      const header = document.querySelector("header");
+      const footer = document.querySelector("footer");
+
+      const headerText = header ? (header.innerText || "") : "";
+      const footerText = footer ? (footer.innerText || "") : "";
+
+      return { headerText, footerText };
+    });
+  } catch {
+    return { headerText: "", footerText: "" };
+  }
+}
+
 async function collectAllLinks(page, base) {
   try {
     return await page.evaluate((baseOrigin) => {
@@ -316,174 +322,56 @@ async function collectAllLinks(page, base) {
   }
 }
 
-// ================= MINIMAL HELPERS (no TS / no placeholders) =================
-function normalizeNumbers(text) {
-  // ако имаш твоя по-умен normalizeNumbers – сложи го тук.
-  return text;
-}
-
-async function extractStructured(page) {
-  // Взимаме максимално безопасно: title + bodyText
-  const rawContent = await page.evaluate(() => {
-    const t = document.title || "";
-    const bodyText = document.body ? document.body.innerText || "" : "";
-    return `${t}\n\n${bodyText}`;
-  });
-  return { rawContent };
-}
-
-async function extractSiteMapFromPage(page) {
-  // Минимално: сканира бутони/форми като selectors + текст
-  try {
-    return await page.evaluate(() => {
-      const buttons = Array.from(document.querySelectorAll("button, a[role='button'], input[type='button'], input[type='submit']"))
-        .slice(0, 200)
-        .map((el) => ({
-          tag: el.tagName.toLowerCase(),
-          text: (el.innerText || el.value || "").trim().slice(0, 120),
-        }))
-        .filter((b) => b.text);
-
-      const forms = Array.from(document.querySelectorAll("form"))
-        .slice(0, 50)
-        .map((f) => ({
-          action: (f.getAttribute("action") || "").slice(0, 200),
-          method: (f.getAttribute("method") || "get").toLowerCase(),
-          inputs: Array.from(f.querySelectorAll("input, textarea, select"))
-            .slice(0, 100)
-            .map((i) => ({
-              name: i.getAttribute("name") || "",
-              type: i.getAttribute("type") || i.tagName.toLowerCase(),
-              placeholder: (i.getAttribute("placeholder") || "").slice(0, 80),
-            })),
-        }));
-
-      return { buttons, forms };
-    });
-  } catch {
-    return { buttons: [], forms: [] };
-  }
-}
-
-function enrichSiteMap(raw, siteId, base) {
-  return {
-    siteId,
-    base,
-    buttons: raw?.buttons || [],
-    forms: raw?.forms || [],
-  };
-}
-
-function buildCombinedSiteMap(maps, siteId, base) {
-  const buttons = [];
-  const forms = [];
-  for (const m of maps || []) {
-    if (Array.isArray(m.buttons)) buttons.push(...m.buttons);
-    if (Array.isArray(m.forms)) forms.push(...m.forms);
-  }
-  return { siteId, base, buttons, forms, generatedAt: new Date().toISOString() };
-}
-
-async function sendSiteMapToWorker(map) {
-  if (!WORKER_URL) return;
-  try {
-    await fetch(`${WORKER_URL.replace(/\/+$/, "")}/sitemap`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        ...(WORKER_SECRET ? { Authorization: `Bearer ${WORKER_SECRET}` } : {}),
-      },
-      body: JSON.stringify(map),
-    });
-  } catch {
-    // no-op
-  }
-}
-
-// ================= PAGE TYPE =================
-function detectPageType(url, title) {
-  const u = (url || "").toLowerCase();
-  const t = (title || "").toLowerCase();
-
-  if (/(contact|контакт)/i.test(u + " " + t)) return "contact";
-  if (/(about|за-нас|about-us)/i.test(u + " " + t)) return "about";
-  if (/(services|услуги|service)/i.test(u + " " + t)) return "services";
-  if (/(blog|news|статии)/i.test(u + " " + t)) return "blog";
-  if (/(shop|product|каталог|продукт)/i.test(u + " " + t)) return "products";
-  return "general";
-}
-
-// ================= PROCESS SINGLE PAGE =================
-async function processPage(page, url, base, stats, siteMaps) {
+// ================= PROCESS PAGE =================
+async function processPage(page, url, base, shellSig, stats) {
   const startTime = Date.now();
 
   try {
     console.log("[PAGE]", url);
-    await page.goto(url, { timeout: 10000, waitUntil: "domcontentloaded" });
+    await page.goto(url, { timeout: 15000, waitUntil: "domcontentloaded" });
 
-    // scroll + eager images
+    // quick scroll to trigger lazy content
     await page.evaluate(async () => {
-      const scrollStep = window.innerHeight;
+      const scrollStep = Math.max(400, Math.floor(window.innerHeight * 0.9));
       const maxScroll = document.body.scrollHeight;
       for (let pos = 0; pos < maxScroll; pos += scrollStep) {
         window.scrollTo(0, pos);
-        await new Promise((r) => setTimeout(r, 100));
+        await new Promise((r) => setTimeout(r, 60));
       }
       window.scrollTo(0, maxScroll);
-
-      document.querySelectorAll('img[loading="lazy"], img[data-src], img[data-lazy]').forEach((img) => {
-        img.loading = "eager";
-        if (img.dataset?.src) img.src = img.dataset.src;
-        if (img.dataset?.lazy) img.src = img.dataset.lazy;
-      });
     });
-
-    await page.waitForTimeout(500);
-    try {
-      await page.waitForLoadState("networkidle", { timeout: 3000 });
-    } catch {}
+    await page.waitForTimeout(250);
 
     const title = clean(await page.title());
-    const pageType = detectPageType(url, title);
-    stats.byType[pageType] = (stats.byType[pageType] || 0) + 1;
 
-    const data = await extractStructured(page);
-    const ocrResults = await ocrAllImages(page, stats);
+    const bodyText = await page.evaluate(() => (document.body ? document.body.innerText || "" : ""));
+    const bodyClean = removeShellFromBody(bodyText, shellSig);
 
-    try {
-      const rawSiteMap = await extractSiteMapFromPage(page);
-      if ((rawSiteMap.buttons?.length || 0) > 0 || (rawSiteMap.forms?.length || 0) > 0) {
-        siteMaps.push(rawSiteMap);
-        console.log(`[SITEMAP] Page: ${rawSiteMap.buttons.length} buttons, ${rawSiteMap.forms.length} forms`);
-      }
-    } catch (e) {
-      console.error("[SITEMAP] Extract error:", e?.message || e);
-    }
+    const ocrTexts = await ocrAllImages(page, stats);
+    const ocrClean = clean(ocrTexts.join("\n\n"));
 
-    const htmlContent = normalizeNumbers(clean(data.rawContent));
-    const ocrTexts = ocrResults.map((r) => r.text);
-    const ocrContent = normalizeNumbers(clean(ocrTexts.join("\n\n")));
+    // cap memory
+    const cappedBody = capText(bodyClean, Math.floor(MAX_CONTENT_CHARS * 0.75));
+    const cappedOcr = capText(ocrClean, Math.floor(MAX_CONTENT_CHARS * 0.25));
 
     const content = `
-=== HTML_CONTENT_START ===
-${htmlContent}
-=== HTML_CONTENT_END ===
+=== MAIN_CONTENT_START ===
+${cappedBody}
+=== MAIN_CONTENT_END ===
 
 === OCR_CONTENT_START ===
-${ocrContent}
+${cappedOcr}
 === OCR_CONTENT_END ===
 `.trim();
 
-    const htmlWords = countWordsExact(htmlContent);
-    const ocrWords = countWordsExact(ocrContent);
-    const totalWords = htmlWords + ocrWords;
-
+    const words = countWordsExact(cappedBody) + countWordsExact(cappedOcr);
     const elapsed = Date.now() - startTime;
-    console.log(`[PAGE] ✓ ${totalWords}w (${htmlWords}+${ocrWords}ocr, ${ocrResults.length} imgs) ${elapsed}ms`);
+
+    console.log(`[PAGE] ✓ words=${words} ocr_imgs=${ocrTexts.length} ${elapsed}ms`);
 
     const links = await collectAllLinks(page, base);
 
-    if (pageType !== "services" && totalWords < MIN_WORDS) {
+    if (words < MIN_WORDS) {
       return { links, page: null };
     }
 
@@ -492,10 +380,8 @@ ${ocrContent}
       page: {
         url,
         title,
-        pageType,
         content,
-        wordCount: totalWords,
-        breakdown: { htmlWords, ocrWords, images: ocrResults.length },
+        wordCount: words,
         status: "ok",
       },
     };
@@ -506,11 +392,11 @@ ${ocrContent}
   }
 }
 
-// ================= CRAWL =================
+// ================= CRAWL (NO SITEMAP) =================
 async function crawlSmart(startUrl, siteId = null) {
   const deadline = Date.now() + MAX_SECONDS * 1000;
   console.log("\n[CRAWL START]", startUrl);
-  console.log(`[CONFIG] ${PARALLEL_TABS} tabs, ${PARALLEL_OCR} parallel OCR`);
+  console.log(`[CONFIG] tabs=${PARALLEL_TABS} max_pages=${MAX_PAGES} max_queue=${MAX_QUEUE}`);
   if (siteId) console.log(`[SITE ID] ${siteId}`);
 
   const browser = await chromium.launch({
@@ -521,7 +407,6 @@ async function crawlSmart(startUrl, siteId = null) {
   const stats = {
     visited: 0,
     saved: 0,
-    byType: {},
     ocrElementsProcessed: 0,
     ocrCharsExtracted: 0,
     errors: 0,
@@ -529,51 +414,56 @@ async function crawlSmart(startUrl, siteId = null) {
 
   const pages = [];
   const queue = [];
-  const siteMaps = [];
   let base = "";
+
+  let siteShell = { header: "", footer: "" };
+  let shellSig = new Set();
 
   try {
     const initContext = await browser.newContext({
-      viewport: { width: 1920, height: 1080 },
+      viewport: { width: 1600, height: 900 },
       userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     });
     const initPage = await initContext.newPage();
 
-    await initPage.goto(startUrl, { timeout: 10000, waitUntil: "domcontentloaded" });
+    await initPage.goto(startUrl, { timeout: 15000, waitUntil: "domcontentloaded" });
     base = new URL(initPage.url()).origin;
 
-    queue.push(normalizeUrl(initPage.url()));
-    const initialLinks = await collectAllLinks(initPage, base);
-    initialLinks.forEach((l) => {
-      const nl = normalizeUrl(l);
-      if (!visited.has(nl) && !SKIP_URL_RE.test(nl) && !queue.includes(nl)) queue.push(nl);
-    });
+    // capture header/footer ONCE
+    const shell = await getHeaderFooterText(initPage);
+    siteShell = {
+      header: clean(shell.headerText),
+      footer: clean(shell.footerText),
+    };
+    shellSig = buildShellSignature(siteShell.header, siteShell.footer);
 
-    const sitemapUrls = await seedUrlsFromSitemap(base);
-    if (sitemapUrls.length > 0) {
-      console.log(`[SITEMAP] Seeded ${sitemapUrls.length} URLs from sitemap`);
-      sitemapUrls.forEach((u) => {
-        if (!visited.has(u) && !queue.includes(u)) queue.push(u);
-      });
-    } else {
-      console.log("[SITEMAP] No sitemap URLs found (or blocked)");
+    console.log(`[SHELL] header=${siteShell.header.length} chars footer=${siteShell.footer.length} chars sig=${shellSig.size} lines`);
+
+    // seed queue from the first page only
+    pushQueue(queue, normalizeUrl(initPage.url()));
+    const initialLinks = await collectAllLinks(initPage, base);
+    for (const l of initialLinks) {
+      const nl = normalizeUrl(l);
+      if (!visited.has(nl) && !SKIP_URL_RE.test(nl) && !queue.includes(nl)) pushQueue(queue, nl);
     }
 
     await initPage.close();
     await initContext.close();
 
-    console.log(`[CRAWL] Found ${queue.length} URLs`);
+    console.log(`[CRAWL] Initial queue size: ${queue.length}`);
 
-    const createWorker = async () => {
-      const ctx = await browser.newContext({
-        viewport: { width: 1920, height: 1080 },
-        userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-      });
-      const pg = await ctx.newPage();
+    const sharedContext = await browser.newContext({
+      viewport: { width: 1600, height: 900 },
+      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    });
+
+    const createWorker = async (idx) => {
+      const pg = await sharedContext.newPage();
 
       while (Date.now() < deadline) {
-        let url = null;
+        if (pages.length >= MAX_PAGES) break;
 
+        let url = null;
         while (queue.length > 0) {
           const candidate = queue.shift();
           const normalized = normalizeUrl(candidate);
@@ -585,45 +475,41 @@ async function crawlSmart(startUrl, siteId = null) {
         }
 
         if (!url) {
-          await new Promise((r) => setTimeout(r, 30));
+          await new Promise((r) => setTimeout(r, 40));
           if (queue.length === 0) break;
           continue;
         }
 
         stats.visited++;
-        const result = await processPage(pg, url, base, stats, siteMaps);
+        const result = await processPage(pg, url, base, shellSig, stats);
 
         if (result.page) {
           pages.push(result.page);
           stats.saved++;
         }
 
-        result.links.forEach((l) => {
+        for (const l of result.links || []) {
           const nl = normalizeUrl(l);
-          if (!visited.has(nl) && !SKIP_URL_RE.test(nl) && !queue.includes(nl)) queue.push(nl);
-        });
+          if (!visited.has(nl) && !SKIP_URL_RE.test(nl) && !queue.includes(nl)) pushQueue(queue, nl);
+          if (queue.length >= MAX_QUEUE) break;
+        }
+
+        if (stats.visited % 10 === 0) {
+          console.log(`[PROGRESS] visited=${stats.visited} saved=${stats.saved} queue=${queue.length} pages_in_mem=${pages.length} worker=${idx}`);
+        }
       }
 
       await pg.close();
-      await ctx.close();
     };
 
-    await Promise.all(Array(PARALLEL_TABS).fill(0).map(() => createWorker()));
+    await Promise.all(Array(PARALLEL_TABS).fill(0).map((_, i) => createWorker(i)));
+    await sharedContext.close();
   } finally {
     await browser.close();
-    console.log(`\n[CRAWL DONE] ${stats.saved}/${stats.visited} pages`);
-    console.log(`[OCR STATS] ${stats.ocrElementsProcessed} images → ${stats.ocrCharsExtracted} chars`);
+    console.log(`\n[CRAWL DONE] saved=${stats.saved} visited=${stats.visited} queue_left=${queue.length}`);
   }
 
-  let combinedSiteMap = null;
-  if (siteMaps.length > 0 && siteId) {
-    console.log(`\n[SITEMAP] Building combined map from ${siteMaps.length} pages...`);
-    const enrichedMaps = siteMaps.map((raw) => enrichSiteMap(raw, siteId, base));
-    combinedSiteMap = buildCombinedSiteMap(enrichedMaps, siteId, base);
-    await sendSiteMapToWorker(combinedSiteMap);
-  }
-
-  return { pages, stats, siteMap: combinedSiteMap };
+  return { siteShell, pages, stats };
 }
 
 // ================= JOBS =================
@@ -692,11 +578,7 @@ http
     if (req.method === "GET" && path === "/health") return json(res, 200, { ok: true });
 
     if (req.method === "GET" && (path === "/" || path === "/status")) {
-      return json(res, 200, {
-        ok: true,
-        authEnabled: Boolean(CRAWLER_SECRET || CRAWLER_TOKEN),
-        jobs: jobs.size,
-      });
+      return json(res, 200, { ok: true, jobs: jobs.size });
     }
 
     if (req.method === "GET" && path === "/result") {
@@ -707,34 +589,14 @@ http
       if (!job) return json(res, 404, { ok: false, error: "Job not found" });
 
       if (job.status === "queued" || job.status === "processing") {
-        return json(res, 202, {
-          ok: true,
-          status: job.status,
-          job_id,
-          url: job.url,
-          site_id: job.site_id,
-        });
+        return json(res, 202, { ok: true, status: job.status, job_id, url: job.url, site_id: job.site_id });
       }
 
       if (job.status === "failed") {
-        return json(res, 200, {
-          ok: false,
-          status: "failed",
-          job_id,
-          url: job.url,
-          site_id: job.site_id,
-          error: job.error,
-        });
+        return json(res, 200, { ok: false, status: "failed", job_id, error: job.error });
       }
 
-      return json(res, 200, {
-        ok: true,
-        status: "ready",
-        job_id,
-        url: job.url,
-        site_id: job.site_id,
-        result: job.result,
-      });
+      return json(res, 200, { ok: true, status: "ready", job_id, result: job.result });
     }
 
     if (req.method === "POST" && path === "/crawl") {
@@ -749,7 +611,6 @@ http
       }
 
       const url = typeof payload.url === "string" ? payload.url.trim() : "";
-
       const site_id =
         (typeof payload.sessionId === "string" && payload.sessionId.trim()) ||
         (typeof payload.site_id === "string" && payload.site_id.trim()) ||
@@ -764,20 +625,9 @@ http
       if (!url) return json(res, 400, { ok: false, error: "Missing url" });
 
       const job_id = startJob({ url, site_id });
-
-      return json(res, 202, {
-        ok: true,
-        accepted: true,
-        job_id,
-        status: "queued",
-        url,
-        site_id,
-      });
+      return json(res, 202, { ok: true, accepted: true, job_id, status: "queued", url, site_id });
     }
 
     return json(res, 404, { ok: false, error: "Not found" });
   })
-  .listen(PORT, () => {
-    console.log(`[BOOT] neo-browser-crawler listening on :${PORT}`);
-    console.log(`[BOOT] auth: ${Boolean(CRAWLER_SECRET || CRAWLER_TOKEN) ? "enabled" : "disabled"}`);
-  });
+  .listen(PORT, () => console.log(`[BOOT] neo-browser-crawler listening on :${PORT}`));
