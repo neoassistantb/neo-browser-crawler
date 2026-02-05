@@ -24,8 +24,7 @@ const OCR_TIMEOUT_MS = 6000;
 
 // In-memory job store
 const JOB_TTL_MS = 15 * 60 * 1000;
-const jobs = new Map<string, any>(); // job_id -> { status, createdAt, startedAt, finishedAt, url, site_id, result, error }
-
+const jobs = new Map();
 const visited = new Set<string>();
 const globalOcrCache = new Map<string, any>();
 
