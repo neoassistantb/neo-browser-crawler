@@ -1,15 +1,22 @@
 import http from "http";
 import { chromium } from "playwright";
+import crypto from "crypto";
 
 const PORT = Number(process.env.PORT || 10000);
 
+// Public endpoint protection (IMPORTANT)
+const CRAWLER_SECRET = process.env.CRAWLER_SECRET || "";
+
 // Worker config - за изпращане на SiteMap
-const WORKER_URL = process.env.NEO_WORKER_URL || "https://neo-workerv2-oky6.onrender.com";
+const WORKER_URL = process.env.NEO_WORKER_URL || "https://neo-worker.onrender.com";
 const WORKER_SECRET = process.env.NEO_WORKER_SECRET || "";
 
 // Supabase config - за записване на SiteMap
 const SUPABASE_URL = process.env.SUPABASE_URL || "";
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
+
+// OCR (move secret to env; hardcoding is dangerous)
+const GOOGLE_VISION_API_KEY = process.env.GOOGLE_VISION_API_KEY || "";
 
 let crawlInProgress = false;
 let crawlFinished = false;
@@ -36,6 +43,46 @@ const clean = (t = "") =>
   t.replace(/\r/g, "").replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
 
 const countWordsExact = (t = "") => t.split(/\s+/).filter(Boolean).length;
+
+function json(res, statusCode, obj) {
+  res.writeHead(statusCode, { "Content-Type": "application/json" });
+  res.end(JSON.stringify(obj));
+}
+
+function getReqId(req) {
+  const h = req.headers["x-request-id"];
+  if (typeof h === "string" && h.trim()) return h.trim();
+  return crypto.randomUUID();
+}
+
+function getPath(req) {
+  try {
+    const url = new URL(req.url || "/", "http://localhost");
+    return url.pathname || "/";
+  } catch {
+    return req.url || "/";
+  }
+}
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = "";
+    req.on("data", c => (body += c));
+    req.on("error", reject);
+    req.on("end", () => resolve(body));
+  });
+}
+
+function checkAuth(req) {
+  // If no secret configured, keep open (not recommended)
+  if (!CRAWLER_SECRET) return true;
+
+  const auth = req.headers["authorization"] || "";
+  if (typeof auth !== "string") return false;
+  const m = auth.match(/^Bearer\s+(.+)$/i);
+  if (!m) return false;
+  return m[1].trim() === CRAWLER_SECRET;
+}
 
 // ================= BG NUMBER NORMALIZER =================
 const BG_0_19 = [
@@ -127,83 +174,83 @@ const KEYWORD_MAP = {
 function generateKeywords(text) {
   const lower = text.toLowerCase().trim();
   const keywords = new Set([lower]);
-  
+
   // Split into words
   const words = lower.split(/\s+/);
   words.forEach(w => {
     if (w.length > 2) keywords.add(w);
   });
-  
+
   // Add mapped keywords
   for (const [bg, en] of Object.entries(KEYWORD_MAP)) {
     if (lower.includes(bg)) {
       en.forEach(k => keywords.add(k));
     }
   }
-  
+
   return Array.from(keywords).filter(k => k.length > 1);
 }
 
 function detectActionType(text) {
   const lower = text.toLowerCase();
-  
+
   if (/резерв|book|запази|reserve/i.test(lower)) return "booking";
   if (/контакт|contact|свържи/i.test(lower)) return "contact";
   if (/търси|search|провери|check|submit|изпрати/i.test(lower)) return "submit";
   if (/стаи|rooms|услуги|services|за нас|about|галерия|gallery/i.test(lower)) return "navigation";
-  
+
   return "other";
 }
 
 function detectFieldType(name, type, placeholder, label) {
   const searchText = `${name} ${type} ${placeholder} ${label}`.toLowerCase();
-  
+
   if (type === "date") return "date";
   if (type === "number") return "number";
   if (/date|дата/i.test(searchText)) return "date";
   if (/guest|човек|брой|count|number/i.test(searchText)) return "number";
   if (/select/i.test(type)) return "select";
-  
+
   return "text";
 }
 
 function generateFieldKeywords(name, placeholder, label) {
   const keywords = new Set();
   const searchText = `${name} ${placeholder} ${label}`.toLowerCase();
-  
+
   // Check-in patterns
   if (/check-?in|checkin|arrival|от|настаняване|пристигане|from|start/i.test(searchText)) {
     ["check-in", "checkin", "от", "настаняване", "arrival", "from"].forEach(k => keywords.add(k));
   }
-  
+
   // Check-out patterns
   if (/check-?out|checkout|departure|до|напускане|заминаване|to|end/i.test(searchText)) {
     ["check-out", "checkout", "до", "напускане", "departure", "to"].forEach(k => keywords.add(k));
   }
-  
+
   // Guests patterns
   if (/guest|adult|човек|гост|брой|persons|pax/i.test(searchText)) {
     ["guests", "гости", "човека", "adults", "persons", "брой"].forEach(k => keywords.add(k));
   }
-  
+
   // Name patterns
   if (/name|име/i.test(searchText)) {
     ["name", "име"].forEach(k => keywords.add(k));
   }
-  
+
   // Email patterns
   if (/email|имейл|e-mail/i.test(searchText)) {
     ["email", "имейл", "e-mail"].forEach(k => keywords.add(k));
   }
-  
+
   // Phone patterns
   if (/phone|телефон|тел/i.test(searchText)) {
     ["phone", "телефон"].forEach(k => keywords.add(k));
   }
-  
+
   // Add name/id as keywords
   if (name) keywords.add(name.toLowerCase());
-  
+
   return Array.from(keywords);
 }
 
@@ -238,8 +285,8 @@ async function extractSiteMapFromPage(page) {
     const isVisible = (el) => {
       const rect = el.getBoundingClientRect();
       const style = window.getComputedStyle(el);
-      return rect.width > 0 && rect.height > 0 && 
-             style.display !== "none" && 
+      return rect.width > 0 && rect.height > 0 &&
+             style.display !== "none" &&
              style.visibility !== "hidden";
     };
 
@@ -262,18 +309,18 @@ async function extractSiteMapFromPage(page) {
     const btnElements = document.querySelectorAll(
       "button, a[href], [role='button'], input[type='submit'], input[type='button'], .btn, .button"
     );
-    
+
     btnElements.forEach((el, i) => {
       if (!isVisible(el)) return;
-      
+
       const text = (el.textContent?.trim() || el.value || "").slice(0, 100);
       if (!text || text.length < 2) return;
-      
+
       // Skip common non-actionable links
       const href = el.href || "";
       if (/^(#|javascript:|mailto:|tel:)/.test(href)) return;
       if (href && !href.includes(window.location.hostname)) return; // Skip external
-      
+
       buttons.push({
         text,
         selector: getSelector(el, i),
@@ -282,16 +329,16 @@ async function extractSiteMapFromPage(page) {
 
     // EXTRACT FORMS
     const forms = [];
-    
+
     document.querySelectorAll("form").forEach((form, formIdx) => {
       if (!isVisible(form)) return;
-      
+
       const fields = [];
-      
+
       form.querySelectorAll("input:not([type='hidden']):not([type='submit']), select, textarea")
         .forEach((input, inputIdx) => {
           if (!isVisible(input)) return;
-          
+
           fields.push({
             name: input.name || input.id || `field_${inputIdx}`,
             selector: getSelector(input, inputIdx),
@@ -300,14 +347,14 @@ async function extractSiteMapFromPage(page) {
             label: getLabel(input),
           });
         });
-      
+
       // Find submit button
       let submitSelector = "";
       const submitBtn = form.querySelector('button[type="submit"], input[type="submit"], button:not([type])');
       if (submitBtn) {
         submitSelector = getSelector(submitBtn, 0);
       }
-      
+
       if (fields.length > 0) {
         forms.push({
           selector: getSelector(form, formIdx),
@@ -320,22 +367,22 @@ async function extractSiteMapFromPage(page) {
     // EXTRACT PRICES
     const prices = [];
     const priceRegex = /(\d+[\s,.]?\d*)\s*(лв\.?|BGN|EUR|€|\$|лева)/gi;
-    
+
     const walker = document.createTreeWalker(
       document.body,
       NodeFilter.SHOW_TEXT,
       null
     );
-    
+
     let node;
     while (node = walker.nextNode()) {
       const text = node.textContent || "";
       const matches = [...text.matchAll(priceRegex)];
-      
+
       matches.forEach(match => {
         const parent = node.parentElement;
         let context = "";
-        
+
         if (parent) {
           const container = parent.closest("div, article, section, li, tr");
           if (container) {
@@ -343,7 +390,7 @@ async function extractSiteMapFromPage(page) {
             if (heading) context = heading.textContent?.trim().slice(0, 50) || "";
           }
         }
-        
+
         // Avoid duplicates
         if (!prices.some(p => p.text === match[0] && p.context === context)) {
           prices.push({
@@ -369,14 +416,14 @@ function enrichSiteMap(raw, siteId, siteUrl) {
   return {
     site_id: siteId,
     url: siteUrl || raw.url || "",
-    
+
     buttons: (raw.buttons || []).map(btn => ({
       text: btn.text,
       selector: btn.selector,
       keywords: generateKeywords(btn.text),
       action_type: detectActionType(btn.text),
     })),
-    
+
     forms: (raw.forms || []).map(form => ({
       selector: form.selector,
       submit_button: form.submit_button,
@@ -387,7 +434,7 @@ function enrichSiteMap(raw, siteId, siteUrl) {
         keywords: generateFieldKeywords(field.name, field.placeholder, field.label),
       })),
     })),
-    
+
     prices: (raw.prices || []).map(p => ({
       text: p.text,
       context: p.context || "",
@@ -404,11 +451,11 @@ function buildCombinedSiteMap(pageSiteMaps, siteId, siteUrl) {
     forms: [],
     prices: [],
   };
-  
+
   const seenButtons = new Set();
   const seenForms = new Set();
   const seenPrices = new Set();
-  
+
   for (const pageMap of pageSiteMaps) {
     // Merge buttons (dedupe by text)
     for (const btn of pageMap.buttons || []) {
@@ -418,7 +465,7 @@ function buildCombinedSiteMap(pageSiteMaps, siteId, siteUrl) {
         combined.buttons.push(btn);
       }
     }
-    
+
     // Merge forms (dedupe by field names)
     for (const form of pageMap.forms || []) {
       const key = form.fields.map(f => f.name).sort().join(",");
@@ -427,7 +474,7 @@ function buildCombinedSiteMap(pageSiteMaps, siteId, siteUrl) {
         combined.forms.push(form);
       }
     }
-    
+
     // Merge prices (dedupe by text+context)
     for (const price of pageMap.prices || []) {
       const key = `${price.text}|${price.context}`;
@@ -437,14 +484,14 @@ function buildCombinedSiteMap(pageSiteMaps, siteId, siteUrl) {
       }
     }
   }
-  
+
   // Limit
   combined.buttons = combined.buttons.slice(0, 50);
   combined.forms = combined.forms.slice(0, 15);
   combined.prices = combined.prices.slice(0, 30);
-  
+
   console.log(`[SITEMAP] Combined: ${combined.buttons.length} buttons, ${combined.forms.length} forms, ${combined.prices.length} prices`);
-  
+
   return combined;
 }
 
@@ -454,7 +501,7 @@ async function saveSiteMapToSupabase(siteMap) {
     console.log("[SITEMAP] Supabase not configured, skipping save");
     return false;
   }
-  
+
   try {
     const response = await fetch(`${SUPABASE_URL}/rest/v1/sites_map`, {
       method: "POST",
@@ -471,7 +518,7 @@ async function saveSiteMapToSupabase(siteMap) {
         updated_at: new Date().toISOString(),
       }),
     });
-    
+
     if (response.ok) {
       console.log(`[SITEMAP] ✓ Saved to Supabase`);
       return true;
@@ -492,13 +539,13 @@ async function sendSiteMapToWorker(siteMap) {
     console.log("[SITEMAP] Worker not configured, skipping");
     return false;
   }
-  
+
   try {
     console.log(`[SITEMAP] Sending to worker: ${WORKER_URL}/prepare-session`);
-    
+
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 30000);
-    
+
     const response = await fetch(`${WORKER_URL}/prepare-session`, {
       method: "POST",
       headers: {
@@ -511,9 +558,9 @@ async function sendSiteMapToWorker(siteMap) {
       }),
       signal: controller.signal,
     });
-    
+
     clearTimeout(timeoutId);
-    
+
     if (response.ok) {
       const result = await response.json();
       console.log(`[SITEMAP] ✓ Worker response:`, result);
@@ -540,7 +587,7 @@ async function extractStructured(page) {
   try {
     return await page.evaluate(() => {
       const seenTexts = new Set();
-      
+
       function addUniqueText(text, minLength = 10) {
         const normalized = text.trim().replace(/\s+/g, ' ');
         if (normalized.length < minLength || seenTexts.has(normalized)) return "";
@@ -636,15 +683,16 @@ async function extractStructured(page) {
 
 // ================= GLOBAL OCR CACHE =================
 const globalOcrCache = new Map();
-const API_KEY = "AIzaSyCoai4BCKJtnnryHbhsPKxJN35UMcMAKrk";
 
 async function fastOCR(buffer) {
   try {
+    if (!GOOGLE_VISION_API_KEY) return "";
+
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), OCR_TIMEOUT_MS);
 
     const res = await fetch(
-      `https://vision.googleapis.com/v1/images:annotate?key=${API_KEY}`,
+      `https://vision.googleapis.com/v1/images:annotate?key=${GOOGLE_VISION_API_KEY}`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -669,7 +717,7 @@ async function fastOCR(buffer) {
 
 async function ocrAllImages(page, stats) {
   const results = [];
-  
+
   try {
     const imgElements = await page.$$("img");
     if (imgElements.length === 0) return results;
@@ -709,7 +757,7 @@ async function ocrAllImages(page, stats) {
             const cachedText = globalOcrCache.get(img.src);
             return { ...img, buffer: null, cached: true, text: cachedText };
           }
-          
+
           if (page.isClosed()) return null;
           const buffer = await img.element.screenshot({ type: 'png', timeout: 2500 });
           return { ...img, buffer, cached: false };
@@ -721,7 +769,7 @@ async function ocrAllImages(page, stats) {
 
     for (let i = 0; i < validScreenshots.length; i += PARALLEL_OCR) {
       const batch = validScreenshots.slice(i, i + PARALLEL_OCR);
-      
+
       const batchResults = await Promise.all(
         batch.map(async (img) => {
           if (img.cached) {
@@ -730,13 +778,13 @@ async function ocrAllImages(page, stats) {
             }
             return null;
           }
-          
+
           if (!img.buffer) return null;
-          
+
           const text = await fastOCR(img.buffer);
-          
+
           globalOcrCache.set(img.src, text);
-          
+
           if (text && text.length > 2) {
             stats.ocrElementsProcessed++;
             stats.ocrCharsExtracted += text.length;
@@ -775,7 +823,7 @@ async function collectAllLinks(page, base) {
 // ================= PROCESS SINGLE PAGE =================
 async function processPage(page, url, base, stats, siteMaps) {
   const startTime = Date.now();
-  
+
   try {
     console.log("[PAGE]", url);
     await page.goto(url, { timeout: 10000, waitUntil: "domcontentloaded" });
@@ -784,23 +832,23 @@ async function processPage(page, url, base, stats, siteMaps) {
     await page.evaluate(async () => {
       const scrollStep = window.innerHeight;
       const maxScroll = document.body.scrollHeight;
-      
+
       for (let pos = 0; pos < maxScroll; pos += scrollStep) {
         window.scrollTo(0, pos);
         await new Promise(r => setTimeout(r, 100));
       }
-      
+
       window.scrollTo(0, maxScroll);
-      
+
       document.querySelectorAll('img[loading="lazy"], img[data-src], img[data-lazy]').forEach(img => {
         img.loading = 'eager';
         if (img.dataset.src) img.src = img.dataset.src;
         if (img.dataset.lazy) img.src = img.dataset.lazy;
       });
     });
-    
+
     await page.waitForTimeout(500);
-    
+
     try {
       await page.waitForLoadState('networkidle', { timeout: 3000 });
     } catch {}
@@ -904,10 +952,10 @@ async function crawlSmart(startUrl, siteId = null) {
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
     });
     const initPage = await initContext.newPage();
-    
+
     await initPage.goto(startUrl, { timeout: 10000, waitUntil: "domcontentloaded" });
     base = new URL(initPage.url()).origin;
-    
+
     const initialLinks = await collectAllLinks(initPage, base);
     queue.push(normalizeUrl(initPage.url()));
     initialLinks.forEach(l => {
@@ -916,7 +964,7 @@ async function crawlSmart(startUrl, siteId = null) {
         queue.push(nl);
       }
     });
-    
+
     await initPage.close();
     await initContext.close();
 
@@ -949,9 +997,9 @@ async function crawlSmart(startUrl, siteId = null) {
         }
 
         stats.visited++;
-        
+
         const result = await processPage(pg, url, base, stats, siteMaps);
-        
+
         if (result.page) {
           pages.push(result.page);
           stats.saved++;
@@ -982,16 +1030,16 @@ async function crawlSmart(startUrl, siteId = null) {
   let combinedSiteMap = null;
   if (siteMaps.length > 0 && siteId) {
     console.log(`\n[SITEMAP] Building combined map from ${siteMaps.length} pages...`);
-    
+
     // Enrich each page's sitemap
     const enrichedMaps = siteMaps.map(raw => enrichSiteMap(raw, siteId, base));
-    
+
     // Combine all
     combinedSiteMap = buildCombinedSiteMap(enrichedMaps, siteId, base);
-    
+
     // Save to Supabase
     await saveSiteMapToSupabase(combinedSiteMap);
-    
+
     // Send to Worker
     await sendSiteMapToWorker(combinedSiteMap);
   }
@@ -1000,11 +1048,29 @@ async function crawlSmart(startUrl, siteId = null) {
 }
 
 // ================= HTTP SERVER =================
+process.on("uncaughtException", (err) => {
+  console.error("[FATAL] uncaughtException:", err);
+});
+process.on("unhandledRejection", (err) => {
+  console.error("[FATAL] unhandledRejection:", err);
+});
+
 http
-  .createServer((req, res) => {
-    if (req.method === "GET") {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      return res.end(JSON.stringify({ 
+  .createServer(async (req, res) => {
+    const reqId = getReqId(req);
+    const path = getPath(req);
+    const started = Date.now();
+    console.log(`[REQ] ${reqId} ${req.method} ${path}`);
+
+    // health
+    if (req.method === "GET" && path === "/health") {
+      return json(res, 200, { ok: true });
+    }
+
+    // status
+    if (req.method === "GET" && (path === "/" || path === "/status")) {
+      return json(res, 200, {
+        ok: true,
         status: crawlInProgress ? "crawling" : (crawlFinished ? "ready" : "idle"),
         crawlInProgress,
         crawlFinished,
@@ -1012,99 +1078,104 @@ http
         lastCrawlTime: lastCrawlTime ? new Date(lastCrawlTime).toISOString() : null,
         resultAvailable: !!lastResult,
         pagesCount: lastResult?.pages?.length || 0,
-        config: { PARALLEL_TABS, MAX_SECONDS, MIN_WORDS, PARALLEL_OCR }
-      }));
+        config: { PARALLEL_TABS, MAX_SECONDS, MIN_WORDS, PARALLEL_OCR },
+        ocrEnabled: Boolean(GOOGLE_VISION_API_KEY),
+      });
     }
 
-    if (req.method !== "POST") {
-      res.writeHead(405, { "Content-Type": "application/json" });
-      return res.end(JSON.stringify({ error: "Method not allowed" }));
+    // Only /crawl accepts POST
+    if (req.method !== "POST" || path !== "/crawl") {
+      return json(res, 404, { ok: false, error: "Not found" });
     }
 
-    let body = "";
-    req.on("data", c => (body += c));
-    req.on("error", err => {
-      res.writeHead(400, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ success: false, error: "Request error" }));
-    });
+    // Auth
+    if (!checkAuth(req)) {
+      console.log(`[AUTH] ${reqId} denied`);
+      return json(res, 401, { ok: false, error: "Unauthorized" });
+    }
 
-    req.on("end", async () => {
-      try {
-        const parsed = JSON.parse(body || "{}");
-        
-        if (!parsed.url) {
-          res.writeHead(400, { "Content-Type": "application/json" });
-          return res.end(JSON.stringify({ 
-            success: false, 
-            error: "Missing 'url' parameter" 
-          }));
-        }
+    // Read body
+    let parsed = {};
+    try {
+      const body = await readBody(req);
+      parsed = JSON.parse(body || "{}");
+    } catch (e) {
+      return json(res, 400, { ok: false, error: "Invalid JSON" });
+    }
 
-        const requestedUrl = normalizeUrl(parsed.url);
-        const siteId = parsed.site_id || null; // NEW: accept site_id
-        const now = Date.now();
+    if (!parsed.url) {
+      return json(res, 400, { ok: false, error: "Missing 'url' parameter" });
+    }
 
-        // Cache check
-        if (crawlFinished && lastResult && lastCrawlUrl === requestedUrl) {
-          if (now - lastCrawlTime < RESULT_TTL_MS) {
-            console.log("[CACHE HIT] Returning cached result for:", requestedUrl);
-            res.writeHead(200, { "Content-Type": "application/json" });
-            return res.end(JSON.stringify({ success: true, cached: true, ...lastResult }));
-          }
-        }
+    const requestedUrl = normalizeUrl(parsed.url);
+    const siteId = parsed.site_id || null;
+    const force = parsed.force === true;
+    const now = Date.now();
 
-        // In progress check
-        if (crawlInProgress) {
-          if (lastCrawlUrl === requestedUrl) {
-            res.writeHead(202, { "Content-Type": "application/json" });
-            return res.end(JSON.stringify({
-              success: false,
-              status: "in_progress",
-              message: "Crawl in progress for this URL"
-            }));
-          } else {
-            res.writeHead(429, { "Content-Type": "application/json" });
-            return res.end(JSON.stringify({
-              success: false,
-              error: "Crawler busy with different URL"
-            }));
-          }
-        }
-
-        // Start new crawl
-        crawlInProgress = true;
-        crawlFinished = false;
-        lastCrawlUrl = requestedUrl;
-        visited.clear();
-        globalOcrCache.clear();
-
-        console.log("[CRAWL START] New crawl for:", requestedUrl);
-        if (siteId) console.log("[SITE ID]", siteId);
-
-        const result = await crawlSmart(parsed.url, siteId);
-
-        crawlInProgress = false;
-        crawlFinished = true;
-        lastResult = result;
-        lastCrawlTime = Date.now();
-
-        console.log("[CRAWL DONE] Result ready for:", requestedUrl);
-
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ success: true, ...result }));
-      } catch (e) {
-        crawlInProgress = false;
-        console.error("[CRAWL ERROR]", e.message);
-        res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({
-          success: false,
-          error: e instanceof Error ? e.message : String(e),
-        }));
+    // Cache check
+    if (!force && crawlFinished && lastResult && lastCrawlUrl === requestedUrl) {
+      if (now - lastCrawlTime < RESULT_TTL_MS) {
+        console.log(`[CACHE HIT] ${reqId} Returning cached result for:`, requestedUrl);
+        console.log(`[REQ DONE] ${reqId} ${Date.now() - started}ms`);
+        return json(res, 200, { success: true, cached: true, ...lastResult });
       }
-    });
+    }
+
+    // In progress check
+    if (crawlInProgress) {
+      if (lastCrawlUrl === requestedUrl) {
+        console.log(`[BUSY] ${reqId} in_progress same URL`);
+        console.log(`[REQ DONE] ${reqId} ${Date.now() - started}ms`);
+        return json(res, 202, {
+          success: false,
+          status: "in_progress",
+          message: "Crawl in progress for this URL"
+        });
+      } else {
+        console.log(`[BUSY] ${reqId} different URL`);
+        console.log(`[REQ DONE] ${reqId} ${Date.now() - started}ms`);
+        return json(res, 429, {
+          success: false,
+          error: "Crawler busy with different URL"
+        });
+      }
+    }
+
+    // Start new crawl
+    crawlInProgress = true;
+    crawlFinished = false;
+    lastCrawlUrl = requestedUrl;
+    visited.clear();
+    globalOcrCache.clear();
+
+    console.log(`[CRAWL START] ${reqId} New crawl for:`, requestedUrl);
+    if (siteId) console.log(`[SITE ID] ${reqId}`, siteId);
+
+    try {
+      const result = await crawlSmart(parsed.url, siteId);
+
+      crawlInProgress = false;
+      crawlFinished = true;
+      lastResult = result;
+      lastCrawlTime = Date.now();
+
+      console.log(`[CRAWL DONE] ${reqId} Result ready for:`, requestedUrl);
+      console.log(`[REQ DONE] ${reqId} ${Date.now() - started}ms`);
+      return json(res, 200, { success: true, ...result });
+    } catch (e) {
+      crawlInProgress = false;
+      console.error(`[CRAWL ERROR] ${reqId}`, e?.message || e);
+      console.log(`[REQ DONE] ${reqId} ${Date.now() - started}ms`);
+      return json(res, 500, {
+        success: false,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
   })
   .listen(PORT, () => {
     console.log("Crawler running on", PORT);
     console.log(`Config: ${PARALLEL_TABS} tabs, ${PARALLEL_OCR} parallel OCR`);
     console.log(`Worker: ${WORKER_URL}`);
+    console.log(`Auth: ${CRAWLER_SECRET ? "enabled" : "DISABLED"}`);
+    console.log(`OCR: ${GOOGLE_VISION_API_KEY ? "enabled" : "DISABLED"}`);
   });
