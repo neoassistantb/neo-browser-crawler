@@ -732,7 +732,71 @@ http
       });
     }
 
+        // ✅ SYNC endpoint: returns content directly in one request
+    if (req.method === "POST" && pathName === "/crawl-sync") {
+      if (!checkAuth(req, reqId)) return json(res, 401, { ok: false, error: "Unauthorized" });
+
+      let payload = {};
+      try {
+        const body = await readBody(req);
+        payload = JSON.parse(body || "{}");
+      } catch {
+        return json(res, 400, { ok: false, error: "Invalid JSON" });
+      }
+
+      const url = typeof payload.url === "string" ? payload.url.trim() : "";
+      const site_id =
+        (typeof payload.sessionId === "string" && payload.sessionId.trim()) ||
+        (typeof payload.site_id === "string" && payload.site_id.trim()) ||
+        "";
+
+      if (!url) return json(res, 400, { ok: false, error: "Missing url" });
+
+      // run a single-job crawl and return NDJSON as a string (fast + low memory)
+      const job = {
+        job_id: crypto.randomUUID(),
+        status: "processing",
+        createdAt: Date.now(),
+        startedAt: Date.now(),
+        finishedAt: null,
+        url,
+        site_id,
+        error: null,
+        visited: new Set(),
+        ocrCache: new Map(),
+        stats: { visited: 0, saved: 0, ocrElementsProcessed: 0, ocrCharsExtracted: 0, errors: 0 },
+        baseOrigin: null,
+        siteShell: null,
+        outputPath: null,
+        lastUrl: null,
+      };
+
+      try {
+        await crawlSmart(url, site_id || null, job);
+
+        // read produced ndjson file and return it (bounded by MAX_PAGES/MAX_CONTENT_CHARS)
+        if (job.outputPath && fs.existsSync(job.outputPath)) {
+          const ndjson = fs.readFileSync(job.outputPath, "utf-8");
+          return json(res, 200, {
+            ok: true,
+            status: "ready",
+            job_id: job.job_id,
+            stats: job.stats,
+            baseOrigin: job.baseOrigin,
+            siteShell: job.siteShell,
+            ndjson,
+          });
+        }
+
+        return json(res, 200, { ok: true, status: "ready", job_id: job.job_id, stats: job.stats, ndjson: "" });
+      } catch (e) {
+        const err = e instanceof Error ? e.message : String(e);
+        return json(res, 500, { ok: false, status: "failed", error: err });
+      }
+    }
+
     if (req.method === "POST" && pathName === "/crawl") {
+
       if (!checkAuth(req, reqId)) return json(res, 401, { ok: false, error: "Unauthorized" });
 
       let payload = {};
