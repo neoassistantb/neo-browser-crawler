@@ -16,19 +16,20 @@ const CRAWLER_TOKEN = process.env.CRAWLER_TOKEN || "";
 const GOOGLE_VISION_API_KEY = process.env.GOOGLE_VISION_API_KEY || "";
 
 // ================= LIMITS =================
-const MAX_SECONDS = Number(process.env.MAX_SECONDS || 180);
+// ✅ safe defaults for Render Starter (512MB). You can override via env.
+const MAX_SECONDS = Number(process.env.MAX_SECONDS || 60);
 const MIN_WORDS = Number(process.env.MIN_WORDS || 20);
 
-const PARALLEL_TABS = Number(process.env.PARALLEL_TABS || 2);
-const PARALLEL_OCR = Number(process.env.PARALLEL_OCR || 6);
-const OCR_TIMEOUT_MS = Number(process.env.OCR_TIMEOUT_MS || 6000);
+const PARALLEL_TABS = Number(process.env.PARALLEL_TABS || 1);
+const PARALLEL_OCR = Number(process.env.PARALLEL_OCR || 2);
+const OCR_TIMEOUT_MS = Number(process.env.OCR_TIMEOUT_MS || 5000);
 
-const MAX_PAGES = Number(process.env.MAX_PAGES || 120);
-const MAX_QUEUE = Number(process.env.MAX_QUEUE || 1200);
+const MAX_PAGES = Number(process.env.MAX_PAGES || 40);
+const MAX_QUEUE = Number(process.env.MAX_QUEUE || 600);
 
 // For memory safety: cap each page content
-const MAX_CONTENT_CHARS = Number(process.env.MAX_CONTENT_CHARS || 80000);
-const MAX_OCR_CACHE = Number(process.env.MAX_OCR_CACHE || 400);
+const MAX_CONTENT_CHARS = Number(process.env.MAX_CONTENT_CHARS || 60000);
+const MAX_OCR_CACHE = Number(process.env.MAX_OCR_CACHE || 250);
 
 // Streaming storage (low memory)
 const JOB_TTL_MS = 15 * 60 * 1000;
@@ -41,16 +42,17 @@ const SKIP_OCR_RE = /\/(logo|favicon|spinner|avatar|pixel|spacer|blank|transpare
 
 console.log(`[BOOT] crawler ESM starting... PORT=${PORT}`);
 console.log(
-  `[BOOT] limits: MAX_SECONDS=${MAX_SECONDS} MIN_WORDS=${MIN_WORDS} PARALLEL_TABS=${PARALLEL_TABS} PARALLEL_OCR=${PARALLEL_OCR} MAX_PAGES=${MAX_PAGES}`,
+  `[BOOT] limits: MAX_SECONDS=${MAX_SECONDS} MIN_WORDS=${MIN_WORDS} PARALLEL_TABS=${PARALLEL_TABS} PARALLEL_OCR=${PARALLEL_OCR} MAX_PAGES=${MAX_PAGES} MAX_QUEUE=${MAX_QUEUE}`,
 );
 console.log(
   `[BOOT] auth: CRAWLER_SECRET=${CRAWLER_SECRET ? "set" : "unset"} CRAWLER_TOKEN=${CRAWLER_TOKEN ? "set" : "unset"} GOOGLE_VISION_API_KEY=${GOOGLE_VISION_API_KEY ? "set" : "unset"}`,
 );
 
+// ✅ Always print memory to understand OOM in Render
 setInterval(() => {
   const m = process.memoryUsage();
   console.log(
-    `[MEM] rss=${Math.round(m.rss / 1024 / 1024)}MB heapUsed=${Math.round(m.heapUsed / 1024 / 1024)}MB`,
+    `[MEM] rss=${Math.round(m.rss / 1024 / 1024)}MB heapUsed=${Math.round(m.heapUsed / 1024 / 1024)}MB ext=${Math.round(m.external / 1024 / 1024)}MB`,
   );
 }, 10_000);
 
@@ -110,6 +112,7 @@ function json(res, status, obj) {
   res.writeHead(status, {
     ...corsHeaders(),
     "Content-Type": "application/json; charset=utf-8",
+    "Cache-Control": "no-store",
   });
   res.end(body);
 }
@@ -137,7 +140,6 @@ function pushQueue(queue, item) {
 }
 
 function jobFilePath(jobId) {
-  // Render allows /tmp writes
   return path.join("/tmp", `neo_crawl_${jobId}.ndjson`);
 }
 
@@ -173,9 +175,7 @@ async function ocrImageUrl(imageUrl, ocrCache) {
     if (ocrCache.has(imageUrl)) return ocrCache.get(imageUrl) || "";
 
     const body = {
-      requests: [
-        { image: { source: { imageUri: imageUrl } }, features: [{ type: "TEXT_DETECTION" }] },
-      ],
+      requests: [{ image: { source: { imageUri: imageUrl } }, features: [{ type: "TEXT_DETECTION" }] }],
     };
 
     const r = await fetch(`https://vision.googleapis.com/v1/images:annotate?key=${GOOGLE_VISION_API_KEY}`, {
@@ -213,7 +213,7 @@ async function ocrAllImages(page, stats, ocrCache) {
     const validImages = imgElements.filter((img) => {
       if (!img.src) return false;
       if (SKIP_OCR_RE.test(img.src)) return false;
-      if (img.w < 80 || img.h < 60) return false;
+      if (img.w < 120 || img.h < 80) return false; // ✅ stricter
       return true;
     });
 
@@ -280,7 +280,6 @@ function removeShellFromBody(bodyText, shellSig) {
     if (shellSig.has(key)) continue;
     kept.push(l);
   }
-  // de-dupe consecutive
   const out = [];
   let prev = "";
   for (const l of kept) {
@@ -347,10 +346,21 @@ async function extractMeta(page) {
 function shouldBlockRequest(url, resourceType) {
   const u = String(url || "").toLowerCase();
   if (resourceType === "media" || resourceType === "font") return true;
+  if (resourceType === "image") return false; // allow images for OCR selection; still filtered by size/regex
   if (u.endsWith(".mp4") || u.endsWith(".mov") || u.endsWith(".avi") || u.endsWith(".webm")) return true;
-  if (u.includes("doubleclick") || u.includes("googlesyndication") || u.includes("facebook") || u.includes("tiktok")) {
-    return true;
-  }
+
+  // ✅ block heavy trackers/ad networks
+  if (
+    u.includes("doubleclick") ||
+    u.includes("googlesyndication") ||
+    u.includes("googletagmanager") ||
+    u.includes("google-analytics") ||
+    u.includes("facebook") ||
+    u.includes("tiktok") ||
+    u.includes("hotjar") ||
+    u.includes("clarity.ms")
+  ) return true;
+
   return false;
 }
 
@@ -365,10 +375,10 @@ async function processPage(page, url, base, shellSig, stats, ocrCache) {
     // light scroll for lazy content
     await page.evaluate(async () => {
       const maxScroll = document.body ? document.body.scrollHeight : 0;
-      const step = Math.max(600, Math.floor(window.innerHeight * 1.1));
-      for (let y = 0; y < Math.min(maxScroll, 5000); y += step) {
+      const step = Math.max(650, Math.floor(window.innerHeight * 1.2));
+      for (let y = 0; y < Math.min(maxScroll, 4500); y += step) {
         window.scrollTo(0, y);
-        await new Promise((r) => setTimeout(r, 40));
+        await new Promise((r) => setTimeout(r, 45));
       }
       window.scrollTo(0, 0);
     });
@@ -433,14 +443,7 @@ ${cappedOcr}
 
     return {
       links,
-      page: {
-        url,
-        title,
-        meta,
-        content,
-        wordCount: words,
-        status: "ok",
-      },
+      page: { url, title, meta, content, wordCount: words, status: "ok" },
     };
   } catch (e) {
     console.error("[PAGE ERROR]", url, e?.message || e);
@@ -462,7 +465,6 @@ async function crawlSmart(startUrl, siteId, job) {
   });
 
   const stats = job.stats;
-
   const queue = [];
   let base = "";
   let siteShell = { header: "", footer: "" };
@@ -521,7 +523,6 @@ async function crawlSmart(startUrl, siteId, job) {
       userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     });
 
-    // route blocking in shared context pages
     const createWorker = async (idx) => {
       const pg = await sharedContext.newPage();
       await pg.route("**/*", (route) => {
@@ -547,7 +548,7 @@ async function crawlSmart(startUrl, siteId, job) {
         }
 
         if (!url) {
-          await new Promise((r) => setTimeout(r, 35));
+          await new Promise((r) => setTimeout(r, 50));
           if (queue.length === 0) break;
           continue;
         }
@@ -559,7 +560,6 @@ async function crawlSmart(startUrl, siteId, job) {
 
         if (result.page) {
           stats.saved++;
-          // stream page to file (no huge RAM)
           out.write(JSON.stringify({ type: "page", ...result.page }) + "\n");
         }
 
@@ -618,7 +618,6 @@ function startJob({ url, site_id }) {
     url,
     site_id,
     error: null,
-    // per-job state (no cross-job race)
     visited: new Set(),
     ocrCache: new Map(),
     stats: { visited: 0, saved: 0, ocrElementsProcessed: 0, ocrCharsExtracted: 0, errors: 0 },
@@ -667,9 +666,18 @@ http
       return res.end();
     }
 
-    console.log(`[REQ] ${reqId} ${req.method} ${pathName}`);
+    // ✅ request log always
+    const ua = typeof req.headers["user-agent"] === "string" ? req.headers["user-agent"] : "";
+    console.log(`[REQ] ${reqId} ${req.method} ${pathName} ua="${ua.slice(0, 80)}"`);
 
-    if (req.method === "GET" && pathName === "/health") return json(res, 200, { ok: true });
+    // ✅ no-auth ping for debugging render routing
+    if (req.method === "GET" && pathName === "/ping") {
+      res.writeHead(200, { ...corsHeaders(), "Content-Type": "text/plain; charset=utf-8" });
+      return res.end("ok");
+    }
+
+    // ✅ health endpoint (set Render Health Check Path to /health)
+    if (req.method === "GET" && pathName === "/health") return json(res, 200, { ok: true, port: PORT, jobs: jobs.size });
 
     if (req.method === "GET" && (pathName === "/" || pathName === "/status")) {
       return json(res, 200, { ok: true, jobs: jobs.size, hint: "POST /crawl then GET /result?job_id=..." });
@@ -714,14 +722,12 @@ http
         return json(res, 200, { ok: false, status: "failed", job_id, error: job.error, stats: job.stats });
       }
 
-      // ready
       return json(res, 200, {
         ok: true,
         status: "ready",
         job_id,
         stats: job.stats,
         baseOrigin: job.baseOrigin,
-        // вместо huge payload
         pages_url: `/download?job_id=${encodeURIComponent(job_id)}`,
       });
     }
@@ -758,4 +764,4 @@ http
 
     return json(res, 404, { ok: false, error: "Not found" });
   })
-  .listen(PORT, () => console.log(`[BOOT] crawler listening on :${PORT}`));
+  .listen(PORT, "0.0.0.0", () => console.log(`[BOOT] crawler listening on 0.0.0.0:${PORT}`));
