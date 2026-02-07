@@ -795,7 +795,69 @@ http
       }
     }
 
-    if (req.method === "POST" && pathName === "/crawl") {
+  // ✅ SYNC endpoint: do crawl and return result in the same request
+if (req.method === "POST" && pathName === "/crawl-sync") {
+  if (!checkAuth(req, reqId)) return json(res, 401, { ok: false, error: "Unauthorized" });
+
+  let payload = {};
+  try {
+    const body = await readBody(req);
+    payload = JSON.parse(body || "{}");
+  } catch {
+    return json(res, 400, { ok: false, error: "Invalid JSON" });
+  }
+
+  const url = typeof payload.url === "string" ? payload.url.trim() : "";
+  const site_id =
+    (typeof payload.sessionId === "string" && payload.sessionId.trim()) ||
+    (typeof payload.site_id === "string" && payload.site_id.trim()) ||
+    "";
+
+  if (!url) return json(res, 400, { ok: false, error: "Missing url" });
+
+  const job = {
+    job_id: crypto.randomUUID(),
+    status: "processing",
+    createdAt: Date.now(),
+    startedAt: Date.now(),
+    finishedAt: null,
+    url,
+    site_id,
+    error: null,
+    visited: new Set(),
+    ocrCache: new Map(),
+    stats: { visited: 0, saved: 0, ocrElementsProcessed: 0, ocrCharsExtracted: 0, errors: 0 },
+    baseOrigin: null,
+    siteShell: null,
+    outputPath: null,
+    lastUrl: null,
+  };
+
+  try {
+    await crawlSmart(url, site_id || null, job);
+
+    let ndjson = "";
+    if (job.outputPath && fs.existsSync(job.outputPath)) {
+      ndjson = fs.readFileSync(job.outputPath, "utf-8");
+    }
+
+    return json(res, 200, {
+      ok: true,
+      status: "ready",
+      job_id: job.job_id,
+      stats: job.stats,
+      baseOrigin: job.baseOrigin,
+      siteShell: job.siteShell,
+      ndjson,
+    });
+  } catch (e) {
+    const err = e instanceof Error ? e.message : String(e);
+    return json(res, 500, { ok: false, status: "failed", error: err });
+  }
+}
+
+if (req.method === "POST" && pathName === "/crawl") {
+
 
       if (!checkAuth(req, reqId)) return json(res, 401, { ok: false, error: "Unauthorized" });
 
