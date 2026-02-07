@@ -31,6 +31,9 @@ const MAX_QUEUE = Number(process.env.MAX_QUEUE || 600);
 const MAX_CONTENT_CHARS = Number(process.env.MAX_CONTENT_CHARS || 60000);
 const MAX_OCR_CACHE = Number(process.env.MAX_OCR_CACHE || 250);
 
+// ✅ Body safety
+const MAX_BODY_BYTES = Number(process.env.MAX_BODY_BYTES || 1024 * 1024); // 1MB
+
 // Streaming storage (low memory)
 const JOB_TTL_MS = 15 * 60 * 1000;
 const jobs = new Map();
@@ -99,26 +102,32 @@ function getQuery(req) {
   }
 }
 
-async function readBody(req, maxBytes = 1024 * 1024) {
+// ✅ safer body reader (limit + errors)
+async function readBody(req, maxBytes = MAX_BODY_BYTES) {
   return await new Promise((resolve, reject) => {
     let data = "";
     let size = 0;
 
     req.on("data", (chunk) => {
-      size += chunk.length;
-      if (size > maxBytes) {
-        reject(new Error("BODY_TOO_LARGE"));
-        req.destroy();
-        return;
+      try {
+        const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        size += buf.length;
+        if (size > maxBytes) {
+          reject(new Error("BODY_TOO_LARGE"));
+          req.destroy();
+          return;
+        }
+        data += buf.toString("utf8");
+      } catch (e) {
+        reject(e);
       }
-      data += chunk.toString("utf8");
     });
 
     req.on("end", () => resolve(data));
     req.on("error", reject);
+    req.on("aborted", () => reject(new Error("BODY_ABORTED")));
   });
 }
-
 
 function json(res, status, obj) {
   const body = JSON.stringify(obj);
@@ -745,28 +754,31 @@ http
       });
     }
 
-        // ✅ SYNC endpoint: returns content directly in one request
+    // ✅ SYNC endpoint: returns content directly in one request
     if (req.method === "POST" && pathName === "/crawl-sync") {
       if (!checkAuth(req, reqId)) return json(res, 401, { ok: false, error: "Unauthorized" });
 
       let payload;
-let rawBody = "";
+      let rawBody = "";
 
-try {
-  rawBody = await readBody(req);
-  if (!rawBody || !rawBody.trim()) {
-    console.log(`[BODY] ${reqId} empty body`);
-    return json(res, 400, { ok: false, error: "Empty body" });
-  }
-  payload = JSON.parse(rawBody);
-} catch (e) {
-  console.log(
-    `[BODY ERROR] ${reqId} content-type=${req.headers["content-type"]} length=${req.headers["content-length"]}`,
-  );
-  console.log(`[BODY RAW] ${reqId}`, rawBody.slice(0, 300));
-  return json(res, 400, { ok: false, error: "Invalid JSON" });
-}
+      try {
+        rawBody = await readBody(req);
+        // ✅ strip UTF-8 BOM if present (PowerShell utf8 often adds it)
+        rawBody = String(rawBody || "").replace(/^\uFEFF/, "").trim();
 
+        if (!rawBody) {
+          console.log(`[BODY] ${reqId} empty body content-type=${req.headers["content-type"]} length=${req.headers["content-length"]}`);
+          return json(res, 400, { ok: false, error: "Empty body" });
+        }
+
+        payload = JSON.parse(rawBody);
+      } catch (e) {
+        console.log(
+          `[BODY ERROR] ${reqId} content-type=${req.headers["content-type"]} length=${req.headers["content-length"]} err=${e instanceof Error ? e.message : String(e)}`,
+        );
+        console.log(`[BODY RAW] ${reqId}`, String(rawBody || "").slice(0, 300));
+        return json(res, 400, { ok: false, error: "Invalid JSON" });
+      }
 
       const url = typeof payload.url === "string" ? payload.url.trim() : "";
       const site_id =
@@ -775,6 +787,8 @@ try {
         "";
 
       if (!url) return json(res, 400, { ok: false, error: "Missing url" });
+
+      console.log(`[SYNC] ${reqId} url=${url} site_id=${site_id || "null"}`);
 
       // run a single-job crawl and return NDJSON as a string (fast + low memory)
       const job = {
