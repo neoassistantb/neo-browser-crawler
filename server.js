@@ -658,7 +658,7 @@ process.on("unhandledRejection", (err) => console.error("[FATAL] unhandledReject
 http
   .createServer(async (req, res) => {
     const reqId = getReqId(req);
-    const pathName = getPath(req);
+    const pathName = getPath(req).replace(/\/+$/, "");
     const q = getQuery(req);
 
     if (req.method === "OPTIONS") {
