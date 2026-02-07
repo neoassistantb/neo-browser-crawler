@@ -793,7 +793,7 @@ http
         const err = e instanceof Error ? e.message : String(e);
         return json(res, 500, { ok: false, status: "failed", error: err });
       }
-    }}
+    }
 
       console.log(`[CRAWL] accepted reqId=${reqId} url=${url} site_id=${site_id || "null"}`);
       const job_id = startJob({ url, site_id });
