@@ -798,7 +798,6 @@ http
       console.log(`[CRAWL] accepted reqId=${reqId} url=${url} site_id=${site_id || "null"}`);
       const job_id = startJob({ url, site_id });
       return json(res, 202, { ok: true, accepted: true, job_id, status: "queued", url, site_id });
-    }
 
     return json(res, 404, { ok: false, error: "Not found" });
   })
