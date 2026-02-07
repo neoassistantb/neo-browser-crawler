@@ -99,13 +99,26 @@ function getQuery(req) {
   }
 }
 
-async function readBody(req) {
-  return await new Promise((resolve) => {
+async function readBody(req, maxBytes = 1024 * 1024) {
+  return await new Promise((resolve, reject) => {
     let data = "";
-    req.on("data", (c) => (data += c));
+    let size = 0;
+
+    req.on("data", (chunk) => {
+      size += chunk.length;
+      if (size > maxBytes) {
+        reject(new Error("BODY_TOO_LARGE"));
+        req.destroy();
+        return;
+      }
+      data += chunk.toString("utf8");
+    });
+
     req.on("end", () => resolve(data));
+    req.on("error", reject);
   });
 }
+
 
 function json(res, status, obj) {
   const body = JSON.stringify(obj);
@@ -736,13 +749,24 @@ http
     if (req.method === "POST" && pathName === "/crawl-sync") {
       if (!checkAuth(req, reqId)) return json(res, 401, { ok: false, error: "Unauthorized" });
 
-      let payload = {};
-      try {
-        const body = await readBody(req);
-        payload = JSON.parse(body || "{}");
-      } catch {
-        return json(res, 400, { ok: false, error: "Invalid JSON" });
-      }
+      let payload;
+let rawBody = "";
+
+try {
+  rawBody = await readBody(req);
+  if (!rawBody || !rawBody.trim()) {
+    console.log(`[BODY] ${reqId} empty body`);
+    return json(res, 400, { ok: false, error: "Empty body" });
+  }
+  payload = JSON.parse(rawBody);
+} catch (e) {
+  console.log(
+    `[BODY ERROR] ${reqId} content-type=${req.headers["content-type"]} length=${req.headers["content-length"]}`,
+  );
+  console.log(`[BODY RAW] ${reqId}`, rawBody.slice(0, 300));
+  return json(res, 400, { ok: false, error: "Invalid JSON" });
+}
+
 
       const url = typeof payload.url === "string" ? payload.url.trim() : "";
       const site_id =
